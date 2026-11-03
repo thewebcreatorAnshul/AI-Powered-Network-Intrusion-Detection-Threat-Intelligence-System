@@ -1,0 +1,45 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+dist/
+build/
+
+# ML models and generated files
+*.joblib
+*.pkl
+*.pickle
+
+# Datasets and packet captures
+datasets/*
+!datasets/README.md
+*.pcap
+*.pcapng
+
+# Uploads and logs
+uploads/
+logs/
+*.log
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
