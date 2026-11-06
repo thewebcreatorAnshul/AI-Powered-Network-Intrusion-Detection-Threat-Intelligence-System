@@ -1,6 +1,6 @@
 # SRS/SDD implementation checklist
 
-This checklist records implementation and verification status for the current M1 code. The authoritative SRS and SDD remain unchanged. “Verified” refers to automated tests/build checks in this repository; it does not imply a live MongoDB or deployment test.
+This checklist records implementation and verification status for the current M1 code. The authoritative SRS and SDD remain unchanged. “Verified” distinguishes automated tests/build checks from live integration and manual end-to-end checks; each verification is stated in its row.
 
 ## Functional requirements
 
@@ -11,8 +11,8 @@ This checklist records implementation and verification status for the current M1
 | FR-03 User administration | Partial | Administrator creates, disables, and assigns roles. A separate settings/rule-management UI is not in the SRS endpoint list and is not implemented. |
 | FR-04 PCAP upload | Implemented | Authenticated upload accepts `.pcap` and `.pcapng`. |
 | FR-05 Upload validation | Implemented | Extension and capture magic, empty/malformed parse, and streamed size checks; safe errors and staging cleanup. |
-| FR-06 Analysis tracking | Implemented | Persisted queued, running, completed, and failed job states; detail endpoint supports polling. |
-| FR-07 Source adapters | Implemented | `SourceAdapter` boundary with PCAP/PCAPNG adapter; no additional sources are claimed. |
+| FR-06 Analysis tracking | Implemented | Persisted queued, running, completed, and failed job states; detail endpoint supports polling. Analysis history was confirmed to persist after a backend restart. |
+| NFR-07 Performance | Measured on demo captures | `demo_syn_scan.pcap` (10 packets) completed in 7 ms; `demo_syn_flood.pcap` (120 packets) completed in 24 ms. Both are below the SRS target of under two minutes. Large/representative capture performance remains unverified. |
 | FR-08 Feature extraction | Implemented | Packet protocol and directional flow counts, bytes, duration, endpoints, and ports are derived without payload retention. |
 | FR-09 Signature detection | Implemented | `SIG-NET-001` TCP SYN port scan and `SIG-NET-002` high-rate SYN burst; stable versions, severity, rationale, and evidence. |
 | FR-10 ML scoring | Not available | No approved model artifact, compatible feature schema, or provenance-documented dataset was present. Jobs explicitly record scoring as skipped. |
@@ -35,7 +35,7 @@ This checklist records implementation and verification status for the current M1
 | NFR-04 Input safety | Implemented | Uploads are size/type/parse validated; captures are parsed as data and never executed. |
 | NFR-05 Privacy | Implemented | Packet payloads are not included in normalized records; staging files are deleted after processing and stale files are cleaned at startup. |
 | NFR-06 Usability | Partial | Responsive sign-in, upload, job, alert, and admin views with empty/loading/error states exist; no evaluator usability session has been measured. |
-| NFR-07 Performance | Not measured | The SRS target is under two minutes for the documented capture; no representative-machine benchmark was available. |
+| NFR-07 Performance | Partial | Demo captures completed below the two-minute target (10 packets: 7 ms; 120 packets: 24 ms). Representative-machine and large-capture benchmarks remain unverified. |
 | NFR-08 Reliability | Implemented | Malformed input and processing-failure paths are covered; failed jobs do not block health routes in tests. |
 | NFR-09 Maintainability | Implemented | API, adapters, feature extraction, rule catalog, persistence, and React views are separated. |
 | NFR-10 Explainability | Implemented | Findings identify signature/rule/version, severity, description, and evidence. |
@@ -53,12 +53,14 @@ This checklist records implementation and verification status for the current M1
 | AC-05 | Verified | Alert persistence, detail, evidence, method, severity, and state are tested. |
 | AC-06 | Verified | Dashboard ownership and severity/time filters plus alert filters are tested. |
 | AC-07 | Verified | A processing failure is persisted as failed and health remains available. |
-| AC-08 | Partial | Setup/demo instructions are documented; a clean-machine reproduction was not performed. |
+| AC-08 | Partial | Clean Python environment setup, backend tests (27 passed), frontend dependency installation, and production build were completed. Live MongoDB connectivity and manual end-to-end workflow were verified. Full clean-machine reproduction remains unverified. |
 
 ## Design deviations and operational limits
 
 - The SDD's replaceable in-process queue is implemented with FastAPI background tasks. It is not durable across process restarts and is intended only for the MVP.
 - The analyzer is a small, explicit signature demonstration. It does not claim broad attack coverage, and no ML scores are fabricated in the absence of an approved artifact.
 - Optional local intelligence requires an authorized file provided by the operator. External lookups are not implemented.
-- Automated tests use an in-memory Mongo-compatible test double because MongoDB was not running in the development environment. Live database integration and the SRS timing target remain to be verified with MongoDB available.
+- Automated tests use an in-memory Mongo-compatible test double.
+- Live MongoDB connectivity was verified through the database health endpoint. Analysis history was confirmed to persist after a backend restart.
+- Demo capture timings were measured; representative-large capture performance remains unverified.
 - The existing SRS and SDD were read-only during implementation.
