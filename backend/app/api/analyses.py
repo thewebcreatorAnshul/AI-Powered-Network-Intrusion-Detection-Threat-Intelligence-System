@@ -8,6 +8,7 @@ from fastapi.responses import Response
 
 from app.audit import record_audit_event
 from app.config import get_settings
+from app.database import required_indexes_ready
 from app.deps import get_current_user, require_self_or_admin
 from app.errors import raise_api_error
 from app.ingestion.base import CaptureError
@@ -42,6 +43,12 @@ def submit_pcap_analysis(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
+    if not required_indexes_ready():
+        raise_api_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "database_not_ready",
+            "Analysis processing is unavailable until database initialization completes.",
+        )
     settings = get_settings()
     original_name = safe_original_filename(file.filename)
     if Path(original_name).suffix.lower() not in {".pcap", ".pcapng"}:

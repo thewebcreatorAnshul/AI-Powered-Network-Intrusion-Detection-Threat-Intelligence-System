@@ -65,6 +65,8 @@ class Settings:
         self.max_upload_mb = _positive_int(os.getenv("MAX_UPLOAD_MB"), 25)
         self.max_upload_bytes = self.max_upload_mb * 1024 * 1024
         self.retention_hours = _positive_int(os.getenv("RETENTION_HOURS"), 24)
+        self.shutdown_grace_seconds = _positive_int(os.getenv("SHUTDOWN_GRACE_SECONDS"), 15)
+        self.mongodb_socket_timeout_ms = _positive_int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS"), 5000)
         if len(self.jwt_secret) < 32:
             raise RuntimeError("JWT_SECRET must contain at least 32 characters.")
 

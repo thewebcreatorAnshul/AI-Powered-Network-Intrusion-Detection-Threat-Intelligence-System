@@ -3,10 +3,13 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+import logging
 
 from fastapi import UploadFile
 
 from app.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class UploadTooLargeError(ValueError):
@@ -65,10 +68,29 @@ def cleanup_stale_uploads(settings: Settings | None = None) -> None:
     directory = settings.upload_dir
     if not directory.is_dir():
         return
+    from pymongo.errors import PyMongoError
+
+    from app.database import get_database
+
+    try:
+        active_jobs = get_database()["analysis_jobs"].find({"$or": [
+            {"status": "queued"},
+            {"status": "running"},
+        ]})
+        referenced_names = {
+            job.get("storage_name")
+            for job in active_jobs
+            if isinstance(job.get("storage_name"), str)
+        }
+    except PyMongoError:
+        logger.warning("Skipping stale upload cleanup because job references are unavailable.")
+        return
     cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.retention_hours)
     cutoff_ts = cutoff.timestamp()
     for item in directory.iterdir():
         if not item.is_file():
+            continue
+        if item.name in referenced_names:
             continue
         try:
             if item.stat().st_mtime < cutoff_ts:

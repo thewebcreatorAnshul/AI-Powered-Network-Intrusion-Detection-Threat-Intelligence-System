@@ -110,6 +110,8 @@ def test_upload_persists_completed_analysis_and_alert(client):
     assert submitted["status"] == "queued"
     job = client.get(f"/api/v1/analyses/{submitted['id']}", headers=auth(token)).json()
     assert job["status"] == "completed"
+    assert "claim_token" not in job
+    assert "alert_outbox" not in job
     assert job["summary"]["packet_count"] == 10
     assert job["summary"]["flow_count"] == 10
     assert job["summary"]["alert_count"] == 1
@@ -118,6 +120,9 @@ def test_upload_persists_completed_analysis_and_alert(client):
     assert alert["severity"] == "high"
     assert alert["method"] == "signature"
     assert alert["status"] == "open"
+    api_alert = client.get("/api/v1/alerts", headers=auth(token)).json()[0]
+    assert "dedupe_key" not in api_alert
+    assert "payload" not in api_alert
     from app.config import get_settings
     assert list(Path(get_settings().upload_dir).glob("*.pcap")) == []
 
@@ -194,7 +199,83 @@ def test_processing_failure_marks_job_failed_and_health_remains_available(client
     result = process_analysis_job(job)
     stored = get_job_by_id(str(job["_id"]))
     assert result["status"] == "failed"
-    assert result["error_code"] == "processing_failed"
+    assert result["error_code"] == "missing_capture"
     assert stored["status"] == "failed"
     assert client.get("/api/v1/health").status_code == 200
     assert client.get("/api/v1/health/database").status_code == 200
+
+
+def test_failed_database_index_initialization_blocks_analysis_until_recovered(monkeypatch, tmp_path):
+    from io import BytesIO
+
+    from fastapi import BackgroundTasks, UploadFile
+    from pymongo.errors import PyMongoError
+    import pytest
+
+    import app.alerts as alerts_module
+    import app.database as database_module
+    import app.main as main_module
+    from app.database import required_indexes_ready
+    from app.config import get_settings
+    from app.api.analyses import submit_pcap_analysis
+    from app.api.health import get_database_health
+    from app.errors import APIError
+    from app.jobs import get_job_by_id
+    from app.ingestion.processor import process_analysis_job
+    from tests.fake_mongo import Client as FakeMongoClient
+    from scapy.all import Ether, IP, TCP, wrpcap
+
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("THREAT_INTEL_MODE", "offline")
+    get_settings.cache_clear()
+    monkeypatch.setattr(database_module, "_client", FakeMongoClient())
+    capture_path = tmp_path / "readiness-capture.pcap"
+    wrpcap(
+        str(capture_path),
+        [Ether() / IP(src="192.0.2.10", dst="192.0.2.20") / TCP(sport=12345, dport=443, flags="S")],
+    )
+    capture_bytes = capture_path.read_bytes()
+
+    def fail_alert_indexes():
+        raise PyMongoError("simulated index initialization failure")
+
+    monkeypatch.setattr(main_module, "ensure_alert_indexes", fail_alert_indexes)
+    try:
+        settings = get_settings()
+        assert main_module.initialize_database(settings) is False
+        assert not required_indexes_ready()
+        health = get_database_health()
+        assert health.status_code == 503
+        assert health.body and b"indexes_unavailable" in health.body
+
+        with pytest.raises(APIError) as blocked:
+            submit_pcap_analysis(
+                BackgroundTasks(),
+                UploadFile(file=BytesIO(capture_bytes), filename="capture.pcap"),
+                {"_id": "readiness-user", "role": NORMAL_USER},
+            )
+        assert blocked.value.status_code == 503
+        assert blocked.value.detail["code"] == "database_not_ready"
+        assert get_database()["analysis_jobs"].find_one({"filename": "capture.pcap"}) is None
+
+        queued = create_analysis_job("readiness-user", "queued.pcap", 10, tmp_path / "queued.pcap")
+        assert process_analysis_job(queued)["status"] == "queued"
+        assert get_job_by_id(str(queued["_id"]))["status"] == "queued"
+        assert alerts_module.relay_next_pending_alert_intent() is False
+
+        # Once index initialization succeeds, the same app can safely accept work.
+        monkeypatch.setattr(main_module, "ensure_alert_indexes", alerts_module.ensure_alert_indexes)
+        assert main_module.initialize_database(settings) is True
+        assert required_indexes_ready()
+        background = BackgroundTasks()
+        accepted = submit_pcap_analysis(
+            background,
+            UploadFile(file=BytesIO(capture_bytes), filename="capture.pcap"),
+            {"_id": "readiness-user", "role": NORMAL_USER},
+        )
+        assert accepted["status"] == "queued"
+        assert len(background.tasks) == 1
+        assert process_analysis_job(get_job_by_id(accepted["id"]))["status"] == "completed"
+        assert get_database_health()["status"] == "ok"
+    finally:
+        get_settings.cache_clear()
