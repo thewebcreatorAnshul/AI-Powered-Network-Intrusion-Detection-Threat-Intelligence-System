@@ -8,6 +8,7 @@ from app.audit import record_audit_event
 from app.errors import raise_api_error
 from app.roles import ADMINISTRATOR
 from app.security import decode_access_token
+from app.token_revocation import is_access_token_revoked
 from app.users import get_user_by_id
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -23,7 +24,7 @@ def get_current_user(
             "Authentication is required.",
         )
     user_id = decode_access_token(credentials.credentials)
-    if user_id is None:
+    if user_id is None or is_access_token_revoked(credentials.credentials):
         raise_api_error(
             status.HTTP_401_UNAUTHORIZED,
             "unauthenticated",

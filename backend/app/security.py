@@ -15,6 +15,7 @@ PBKDF2_ITERATIONS = 210_000
 HASH_NAME = "sha256"
 SALT_BYTES = 16
 DK_LEN = 32
+MAX_ACCEPTED_PBKDF2_ITERATIONS = 1_000_000
 JWT_ALGORITHM = "HS256"
 
 
@@ -36,13 +37,20 @@ def verify_password(password: str, password_hash: str) -> bool:
         if algorithm != PBKDF2_ALGORITHM:
             return False
         iterations = int(iteration_text)
+        if not 1 <= iterations <= MAX_ACCEPTED_PBKDF2_ITERATIONS:
+            return False
+        if len(salt) != SALT_BYTES * 2 or len(digest_hex) != DK_LEN * 2:
+            return False
+        salt_bytes = bytes.fromhex(salt)
         expected = bytes.fromhex(digest_hex)
+        if len(salt_bytes) != SALT_BYTES or len(expected) != DK_LEN:
+            return False
         actual = hashlib.pbkdf2_hmac(
             HASH_NAME,
             password.encode("utf-8"),
-            bytes.fromhex(salt),
+            salt_bytes,
             iterations,
-            dklen=len(expected),
+            dklen=DK_LEN,
         )
         return hmac.compare_digest(actual, expected)
     except (ValueError, TypeError):
@@ -61,16 +69,23 @@ def create_access_token(subject: str) -> str:
 
 
 def decode_access_token(token: str) -> str | None:
-    settings = get_settings()
-    try:
-        payload = jwt.decode(
-            token,
-            settings.jwt_secret,
-            algorithms=[JWT_ALGORITHM],
-        )
-    except InvalidTokenError:
+    payload = decode_access_token_payload(token)
+    if payload is None:
         return None
     subject = payload.get("sub")
     if not isinstance(subject, str) or not subject:
         return None
     return subject
+
+
+def decode_access_token_payload(token: str) -> dict | None:
+    settings = get_settings()
+    try:
+        return jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["exp", "sub"]},
+        )
+    except InvalidTokenError:
+        return None

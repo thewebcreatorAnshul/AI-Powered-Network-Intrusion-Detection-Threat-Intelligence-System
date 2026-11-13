@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from bson import ObjectId
@@ -29,6 +30,19 @@ def ensure_job_indexes() -> None:
     collection.create_index("status")
     collection.create_index("created_at")
     collection.create_index("submitted_by")
+    collection.create_index("storage_name", name="jobs_storage_name_cleanup")
+    collection.create_index(
+        [("submitted_by", 1), ("created_at", -1), ("_id", -1)],
+        name="jobs_owner_created_page",
+    )
+    collection.create_index(
+        [("submitted_by", 1), ("status", 1), ("created_at", -1), ("_id", -1)],
+        name="jobs_owner_status_created_page",
+    )
+    collection.create_index(
+        [("status", 1), ("created_at", -1), ("_id", -1)],
+        name="jobs_status_created_page",
+    )
 
 
 def now_utc() -> datetime:
@@ -110,11 +124,15 @@ def list_jobs_page(
             query["created_at"]["$gte"] = since
         if until:
             query["created_at"]["$lte"] = until
-    documents = list(jobs_collection().find(query).sort("created_at", -1))
     if q:
-        needle = q.casefold()
-        documents = [job for job in documents if needle in job.get("filename", "").casefold()]
-    return documents[skip : skip + limit]
+        query["filename"] = {"$regex": re.escape(q), "$options": "i"}
+    return list(
+        jobs_collection()
+        .find(query)
+        .sort([("created_at", -1), ("_id", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
 
 
 def list_recoverable_jobs() -> list[dict]:
@@ -189,6 +207,17 @@ def renew_job_lease(job_id, claim_token: str) -> bool:
         }},
     )
     return result.matched_count == 1
+
+
+def job_claim_is_active(job_id, claim_token: str, *, timestamp=None) -> bool:
+    """Check whether a claim still owns a live processing lease."""
+    timestamp = timestamp or now_utc()
+    return jobs_collection().find_one({
+        "_id": job_id,
+        "status": JOB_RUNNING,
+        "claim_token": claim_token,
+        "lease_expires_at": {"$gt": timestamp},
+    }) is not None
 
 
 def enqueue_alert_intent(job_id, claim_token: str, intent: dict) -> bool:

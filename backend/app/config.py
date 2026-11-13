@@ -47,6 +47,8 @@ class Settings:
         if self.threat_intel_mode not in {"offline", "local"}:
             raise RuntimeError("THREAT_INTEL_MODE must be 'offline' or 'local'.")
         self.allowed_origins = _split_origins(os.getenv("ALLOWED_ORIGINS"))
+        if "*" in self.allowed_origins:
+            raise RuntimeError("ALLOWED_ORIGINS must list explicit browser origins; wildcard origins are not allowed.")
         self.api_prefix = "/api/v1"
         self.jwt_secret = os.getenv("JWT_SECRET", "").strip()
         self.jwt_expire_minutes = _positive_int(os.getenv("JWT_EXPIRE_MINUTES"), 60)
@@ -67,6 +69,8 @@ class Settings:
         self.retention_hours = _positive_int(os.getenv("RETENTION_HOURS"), 24)
         self.shutdown_grace_seconds = _positive_int(os.getenv("SHUTDOWN_GRACE_SECONDS"), 15)
         self.mongodb_socket_timeout_ms = _positive_int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS"), 5000)
+        self.max_analysis_packets = _positive_int(os.getenv("MAX_ANALYSIS_PACKETS"), 50000)
+        self.analysis_timeout_seconds = _positive_int(os.getenv("ANALYSIS_TIMEOUT_SECONDS"), 120)
         if len(self.jwt_secret) < 32:
             raise RuntimeError("JWT_SECRET must contain at least 32 characters.")
 

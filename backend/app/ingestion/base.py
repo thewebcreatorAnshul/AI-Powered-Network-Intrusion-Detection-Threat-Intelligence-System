@@ -22,6 +22,11 @@ class UnsupportedCaptureError(CaptureError):
     message = "The capture format is not supported. Upload a PCAP or PCAPNG file."
 
 
+class CaptureProcessingLimitError(CaptureError):
+    error_code = "capture_processing_limit"
+    message = "The capture exceeds the configured analysis processing limits."
+
+
 class InvalidCaptureError(CaptureError):
     error_code = "invalid_capture"
     message = "The capture could not be parsed."

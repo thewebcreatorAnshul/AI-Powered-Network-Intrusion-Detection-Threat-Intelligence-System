@@ -72,28 +72,23 @@ def cleanup_stale_uploads(settings: Settings | None = None) -> None:
 
     from app.database import get_database
 
-    try:
-        active_jobs = get_database()["analysis_jobs"].find({"$or": [
-            {"status": "queued"},
-            {"status": "running"},
-        ]})
-        referenced_names = {
-            job.get("storage_name")
-            for job in active_jobs
-            if isinstance(job.get("storage_name"), str)
-        }
-    except PyMongoError:
-        logger.warning("Skipping stale upload cleanup because job references are unavailable.")
-        return
+    jobs = get_database()["analysis_jobs"]
     cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.retention_hours)
     cutoff_ts = cutoff.timestamp()
     for item in directory.iterdir():
         if not item.is_file():
             continue
-        if item.name in referenced_names:
-            continue
         try:
             if item.stat().st_mtime < cutoff_ts:
+                referenced = jobs.find_one({
+                    "storage_name": item.name,
+                    "$or": [{"status": "queued"}, {"status": "running"}],
+                })
+                if referenced is not None:
+                    continue
                 item.unlink(missing_ok=True)
+        except PyMongoError:
+            logger.warning("Skipping remaining stale upload cleanup because job references are unavailable.")
+            return
         except OSError:
             continue

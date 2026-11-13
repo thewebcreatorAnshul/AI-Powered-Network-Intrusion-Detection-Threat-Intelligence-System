@@ -1,6 +1,7 @@
 """Minimal in-memory Mongo-compatible store for deterministic API tests."""
 
 from copy import deepcopy
+import re
 from threading import RLock
 
 from bson import ObjectId
@@ -47,6 +48,13 @@ def _matches(document: dict, query: dict) -> bool:
                     return False
                 if operator == "$gt" and not any(item is not None and item > value for item in values):
                     return False
+                if operator == "$regex":
+                    options = expected.get("$options", "")
+                    flags = re.IGNORECASE if "i" in options else 0
+                    if not any(isinstance(item, str) and re.search(value, item, flags) for item in values):
+                        return False
+                if operator == "$options":
+                    continue
         elif expected not in values:
             return False
     return True
@@ -81,8 +89,18 @@ def _apply_update(document: dict, update: dict, query: dict) -> None:
 
 
 class Cursor(list):
-    def sort(self, key: str, direction: int = 1):
-        return Cursor(sorted(self, key=lambda item: item.get(key), reverse=direction < 0))
+    def sort(self, key: str | list, direction: int = 1):
+        keys = [(key, direction)] if isinstance(key, str) else list(key)
+        rows = list(self)
+        for field, order in reversed(keys):
+            rows.sort(key=lambda item: item.get(field), reverse=order < 0)
+        return Cursor(rows)
+
+    def skip(self, amount: int):
+        return Cursor(self[amount:])
+
+    def limit(self, amount: int):
+        return Cursor(self[:amount])
 
 
 class Result:
@@ -90,6 +108,7 @@ class Result:
         self.inserted_id = inserted_id
         self.matched_count = matched_count
         self.upserted_id = upserted_id
+        self.deleted_count = matched_count
 
 
 class Collection:
@@ -97,12 +116,24 @@ class Collection:
         self.documents = []
         self._lock = RLock()
         self.unique_indexes = []
+        self.indexes = {}
 
-    def create_index(self, keys, *, unique=False, sparse=False, **_kwargs):
+    def create_index(self, keys, *, unique=False, sparse=False, **kwargs):
+        name = kwargs.get("name") or (keys if isinstance(keys, str) else "_".join(f"{field}_{direction}" for field, direction in keys))
+        key_spec = [(keys, 1)] if isinstance(keys, str) else list(keys)
+        self.indexes[name] = {
+            "key": key_spec,
+            "unique": unique,
+            "sparse": sparse,
+            "expireAfterSeconds": kwargs.get("expireAfterSeconds"),
+        }
         if unique:
             fields = (keys,) if isinstance(keys, str) else tuple(field for field, _direction in keys)
             self.unique_indexes.append((fields, unique, sparse))
-        return "index"
+        return name
+
+    def index_information(self):
+        return deepcopy(self.indexes)
 
     def _check_unique(self, document, excluding_id=None):
         for fields, _unique, sparse in self.unique_indexes:
@@ -130,6 +161,12 @@ class Collection:
 
     def find(self, query=None):
         return Cursor(deepcopy(item) for item in self.documents if _matches(item, query or {}))
+
+    def count_documents(self, query=None):
+        return sum(1 for item in self.documents if _matches(item, query or {}))
+
+    def aggregate(self, pipeline):
+        return Cursor(_aggregate_pipeline(deepcopy(self.documents), pipeline))
 
     def update_one(self, query, update, upsert=False):
         with self._lock:
@@ -197,3 +234,34 @@ class Client:
 
     def close(self):
         return None
+
+
+def _aggregate_pipeline(documents, pipeline):
+    rows = list(documents)
+    for stage in pipeline:
+        if "$match" in stage:
+            rows = [row for row in rows if _matches(row, stage["$match"])]
+        elif "$count" in stage:
+            rows = [{stage["$count"]: len(rows)}] if rows else []
+        elif "$group" in stage:
+            spec = stage["$group"]
+            key_expression = spec.get("_id")
+            groups = {}
+            for row in rows:
+                key = row.get(key_expression[1:]) if isinstance(key_expression, str) and key_expression.startswith("$") else key_expression
+                current = groups.setdefault(key, {"_id": key})
+                for output, expression in spec.items():
+                    if output == "_id":
+                        continue
+                    if isinstance(expression, dict) and "$sum" in expression:
+                        amount = expression["$sum"]
+                        current[output] = current.get(output, 0) + (amount if isinstance(amount, (int, float)) else 0)
+            rows = list(groups.values())
+        elif "$facet" in stage:
+            rows = [{
+                name: _aggregate_pipeline(deepcopy(rows), subpipeline)
+                for name, subpipeline in stage["$facet"].items()
+            }]
+        else:
+            raise NotImplementedError(f"Unsupported fake aggregation stage: {stage}")
+    return rows

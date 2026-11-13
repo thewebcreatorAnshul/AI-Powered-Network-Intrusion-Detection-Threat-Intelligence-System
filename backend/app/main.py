@@ -25,11 +25,15 @@ from app.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
+from app.middleware import UploadBodyLimitMiddleware
 from app.users import apply_administrator_startup, ensure_user_indexes
 from app.jobs import claim_next_recoverable_job, ensure_job_indexes
 from app.ingestion.processor import process_claimed_analysis_job, wait_for_active_heartbeats
 from app.alerts import ensure_alert_indexes, relay_next_pending_alert_intent
 from app.ingestion.storage import cleanup_stale_uploads
+from app.task_coordinator import AnalysisTaskCoordinator
+from app.analysis_results import ensure_analysis_result_indexes, cleanup_orphaned_analysis_findings
+from app.token_revocation import ensure_token_revocation_indexes, cleanup_expired_token_revocations
 
 logger = logging.getLogger(__name__)
 RECOVERY_WORKER_COUNT = 2
@@ -40,34 +44,43 @@ RECOVERY_ERROR_WAIT_SECONDS = 1.0
 def initialize_database(settings) -> bool:
     """Initialize required indexes and mark processing ready only on success."""
     set_required_indexes_ready(False)
+    if not settings.mongodb_uri or not settings.mongodb_database:
+        logger.error("Application database initialization failed (MongoDB is not configured).")
+        return False
     try:
         ensure_user_indexes()
         ensure_job_indexes()
         ensure_alert_indexes()
+        ensure_analysis_result_indexes()
+        ensure_token_revocation_indexes()
         apply_administrator_startup(
             settings.admin_username,
             settings.admin_password,
             reset_password=settings.admin_password_reset,
         )
-    except PyMongoError:
-        logger.exception("Application database initialization failed.")
+    except PyMongoError as exc:
+        logger.error("Application database initialization failed (%s).", type(exc).__name__)
         return False
     set_required_indexes_ready(True)
     return True
 
 
 def _run_recovery_worker(stop_event: Event) -> None:
+    finding_cursor = None
     while not stop_event.is_set():
         try:
+            cleanup_expired_token_revocations()
+            scanned, _deleted, next_cursor = cleanup_orphaned_analysis_findings(after_id=finding_cursor)
+            finding_cursor = next_cursor if scanned else None
             if relay_next_pending_alert_intent():
                 continue
             job = claim_next_recoverable_job()
-        except PyMongoError:
-            logger.exception("Analysis job recovery could not reach MongoDB; retrying.")
+        except PyMongoError as exc:
+            logger.error("Analysis job recovery could not reach MongoDB (%s); retrying.", type(exc).__name__)
             stop_event.wait(RECOVERY_ERROR_WAIT_SECONDS)
             continue
-        except Exception:
-            logger.exception("Recovery dispatcher encountered an unexpected error; retrying.")
+        except Exception as exc:
+            logger.error("Recovery dispatcher encountered an unexpected error (%s); retrying.", type(exc).__name__)
             stop_event.wait(RECOVERY_ERROR_WAIT_SECONDS)
             continue
         if job is not None:
@@ -111,9 +124,52 @@ def _shutdown_recovery_workers(stop_event: Event, worker_futures, recovery_execu
     return True
 
 
+def _finish_application_shutdown(coordinator, worker_futures, recovery_executor) -> None:
+    """Defer database closure until all foreground and recovery work has exited."""
+    wait(worker_futures)
+    coordinator.wait_until_idle()
+    wait_for_active_heartbeats()
+    recovery_executor.shutdown(wait=True, cancel_futures=True)
+    close_client()
+
+
+def _shutdown_application_work(
+    coordinator: AnalysisTaskCoordinator,
+    recovery_stop: Event,
+    worker_futures,
+    recovery_executor,
+    grace_seconds: float,
+) -> bool:
+    """Cancel tracked work and wait no longer than the configured grace period."""
+    deadline = time.monotonic() + grace_seconds
+    coordinator.request_shutdown()
+    recovery_stop.set()
+
+    _, pending_workers = wait(worker_futures, timeout=max(0.0, deadline - time.monotonic()))
+    foreground_stopped = coordinator.wait_until_idle(max(0.0, deadline - time.monotonic()))
+    heartbeats_stopped = wait_for_active_heartbeats(max(0.0, deadline - time.monotonic()))
+    if pending_workers or not foreground_stopped or not heartbeats_stopped:
+        logger.warning(
+            "Application work exceeded the %.3f second shutdown grace period; database close is deferred.",
+            grace_seconds,
+        )
+        recovery_executor.shutdown(wait=False, cancel_futures=True)
+        Thread(
+            target=_finish_application_shutdown,
+            args=(coordinator, worker_futures, recovery_executor),
+            name="analysis-application-shutdown",
+            daemon=True,
+        ).start()
+        return False
+    recovery_executor.shutdown(wait=True, cancel_futures=True)
+    close_client()
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    del app
+    coordinator = AnalysisTaskCoordinator()
+    app.state.analysis_task_coordinator = coordinator
     settings = get_settings()
     db_ready = initialize_database(settings)
 
@@ -124,15 +180,16 @@ async def lifespan(app: FastAPI):
     )
     recovery_workers = []
     try:
-        cleanup_stale_uploads(settings)
         if db_ready:
+            cleanup_stale_uploads(settings)
             recovery_workers = [
                 recovery_executor.submit(_run_recovery_worker, recovery_stop)
                 for _ in range(RECOVERY_WORKER_COUNT)
             ]
         yield
     finally:
-        _shutdown_recovery_workers(
+        _shutdown_application_work(
+            coordinator,
             recovery_stop,
             recovery_workers,
             recovery_executor,
@@ -149,11 +206,16 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     application.add_middleware(
+        UploadBodyLimitMiddleware,
+        path=f"{settings.api_prefix}/analyses",
+        max_body_bytes=settings.max_upload_bytes + 65_536,
+    )
+    application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PATCH"],
+        allow_headers=["Authorization", "Content-Type"],
     )
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
     application.add_exception_handler(RequestValidationError, validation_exception_handler)

@@ -3,9 +3,6 @@
 from collections.abc import Iterator
 from pathlib import Path
 from scapy.layers.l2 import Ether
-from scapy.packet import Raw
-
-from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
@@ -114,9 +111,9 @@ class PcapSourceAdapter(SourceAdapter):
             raise InvalidCaptureError() from exc
         try:
             for packet in reader:
-                    if isinstance(packet, Raw) and capture_format == "pcap":
-                        packet = Ether(bytes(packet))
-                    yield _safe_record(packet)
+                if isinstance(packet, Raw) and capture_format == "pcap":
+                    packet = Ether(bytes(packet))
+                yield _safe_record(packet)
         except InvalidCaptureError:
             raise
         except Exception as exc:
