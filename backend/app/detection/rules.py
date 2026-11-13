@@ -22,11 +22,17 @@ def detect_syn_port_scan(records: list[dict], *, min_ports: int = 10, window_sec
     for (source, target), attempts in probes.items():
         attempts.sort()
         left = 0
+        port_counts: dict[int, int] = defaultdict(int)
         for right, (timestamp, _port) in enumerate(attempts):
             while timestamp - attempts[left][0] > window_seconds:
+                expired_port = attempts[left][1]
+                port_counts[expired_port] -= 1
+                if port_counts[expired_port] == 0:
+                    del port_counts[expired_port]
                 left += 1
-            ports = sorted({port for _time, port in attempts[left : right + 1]})
-            if len(ports) >= min_ports:
+            port_counts[_port] += 1
+            if len(port_counts) >= min_ports:
+                ports = sorted(port_counts)
                 findings.append({
                     "rule_id": "SIG-NET-001",
                     "rule_version": "1.0.0",

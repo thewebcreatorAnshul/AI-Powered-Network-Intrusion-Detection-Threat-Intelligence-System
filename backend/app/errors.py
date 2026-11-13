@@ -3,8 +3,11 @@
 from fastapi import HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+import logging
 from pymongo.errors import PyMongoError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger(__name__)
 
 
 def error_payload(code: str, message: str) -> dict:
@@ -49,6 +52,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     del request
+    logger.error("Unhandled request failure (%s).", type(exc).__name__)
     if isinstance(exc, PyMongoError):
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

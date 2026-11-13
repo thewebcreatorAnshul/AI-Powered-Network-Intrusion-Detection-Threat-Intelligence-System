@@ -3,17 +3,24 @@
 from pathlib import Path
 from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile, status
-from fastapi.responses import Response
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, Request, UploadFile, status
+from fastapi.responses import Response, StreamingResponse
 
 from app.audit import record_audit_event
+from app.analysis_results import (
+    FINDING_PAGE_DEFAULT,
+    FINDING_PAGE_MAX,
+    get_analysis_findings_page,
+    iter_analysis_findings,
+)
 from app.config import get_settings
 from app.database import required_indexes_ready
 from app.deps import get_current_user, require_self_or_admin
+from app.csv_utils import spreadsheet_safe
 from app.errors import raise_api_error
 from app.ingestion.base import CaptureError
 from app.ingestion.pcap import PcapSourceAdapter
-from app.ingestion.processor import process_analysis_job
+from app.ingestion.processor import run_foreground_analysis_job
 from app.ingestion.storage import (
     UploadTooLargeError,
     delete_staged_file,
@@ -29,6 +36,7 @@ from app.jobs import (
 )
 from app.roles import ADMINISTRATOR
 from app.schemas import AnalysisJobResponse
+from app.task_coordinator import AnalysisTaskCoordinator
 
 router = APIRouter(prefix="/analyses", tags=["analyses"])
 
@@ -42,6 +50,7 @@ def submit_pcap_analysis(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
+    request: Request = None,
 ) -> dict:
     if not required_indexes_ready():
         raise_api_error(
@@ -96,29 +105,47 @@ def submit_pcap_analysis(
         )
         _raise_capture_error(exc)
 
-    job = create_analysis_job(
-        submitted_by=str(current_user["_id"]),
-        filename=original_name,
-        file_size=file_size,
-        storage_path=destination,
-    )
-    record_audit_event(
-        str(current_user["_id"]),
-        "upload",
-        "analysis_job",
-        str(job["_id"]),
-        "success",
-        {"filename": original_name, "file_size": file_size},
-    )
-    background_tasks.add_task(process_analysis_job, job)
-    record_audit_event(
-        str(current_user["_id"]),
-        "analysis_launch",
-        "analysis_job",
-        str(job["_id"]),
-        "queued",
-        {"status": job.get("status")},
-    )
+    coordinator = (
+        getattr(request.app.state, "analysis_task_coordinator", None)
+        if request is not None
+        else None
+    ) or AnalysisTaskCoordinator()
+    task = coordinator.register()
+    if task is None:
+        delete_staged_file(destination)
+        raise_api_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "application_shutting_down",
+            "The service is shutting down and cannot accept analysis work.",
+        )
+
+    try:
+        job = create_analysis_job(
+            submitted_by=str(current_user["_id"]),
+            filename=original_name,
+            file_size=file_size,
+            storage_path=destination,
+        )
+        record_audit_event(
+            str(current_user["_id"]),
+            "upload",
+            "analysis_job",
+            str(job["_id"]),
+            "success",
+            {"filename": original_name, "file_size": file_size},
+        )
+        record_audit_event(
+            str(current_user["_id"]),
+            "analysis_launch",
+            "analysis_job",
+            str(job["_id"]),
+            "queued",
+            {"status": job.get("status")},
+        )
+        background_tasks.add_task(run_foreground_analysis_job, job, coordinator, task)
+    except Exception:
+        coordinator.finish(task)
+        raise
     return serialize_job(job)
 
 
@@ -138,13 +165,56 @@ def list_analysis_jobs(
     return [serialize_job(job) for job in list_jobs_page(owner_id, skip=skip, limit=limit, status=status_filter, q=q, since=since, until=until)]
 
 
+def _serialize_analysis_detail(job: dict, *, skip: int = 0, limit: int = FINDING_PAGE_DEFAULT) -> dict:
+    response = serialize_job(job)
+    if response["summary"] is None:
+        return response
+    findings, total = get_analysis_findings_page(job, skip=skip, limit=limit)
+    response["summary"] = {
+        **response["summary"],
+        "findings": findings,
+        "findings_pagination": {
+            "skip": skip,
+            "limit": limit,
+            "total": total,
+            "has_more": skip + len(findings) < total,
+        },
+    }
+    return response
+
+
 @router.get("/{job_id}", response_model=AnalysisJobResponse)
-def get_analysis_job(job_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+def get_analysis_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
     job = get_job_by_id(job_id)
     if job is None:
         raise_api_error(status.HTTP_404_NOT_FOUND, "not_found", "Analysis job not found.")
     require_self_or_admin(current_user, job["submitted_by"])
-    return serialize_job(job)
+    return _serialize_analysis_detail(job)
+
+
+@router.get("/{job_id}/findings")
+def list_analysis_findings(
+    job_id: str,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=FINDING_PAGE_DEFAULT, ge=1, le=FINDING_PAGE_MAX),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    job = get_job_by_id(job_id)
+    if job is None:
+        raise_api_error(status.HTTP_404_NOT_FOUND, "not_found", "Analysis job not found.")
+    require_self_or_admin(current_user, job["submitted_by"])
+    findings, total = get_analysis_findings_page(job, skip=skip, limit=limit)
+    return {
+        "analysis_id": str(job["_id"]),
+        "items": findings,
+        "skip": skip,
+        "limit": limit,
+        "total": total,
+        "has_more": skip + len(findings) < total,
+    }
 
 
 @router.get("/{job_id}/export")
@@ -156,18 +226,32 @@ def export_analysis_summary(job_id: str, current_user: dict = Depends(get_curren
     if job is None:
         raise_api_error(status.HTTP_404_NOT_FOUND, "not_found", "Analysis job not found.")
     require_self_or_admin(current_user, job["submitted_by"])
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["analysis_id", "filename", "status", "created_at", "packet_count", "flow_count", "alert_count", "findings"])
     summary = job.get("summary") or {}
-    writer.writerow([
-        str(job["_id"]), job.get("filename", ""), job.get("status", ""),
-        job.get("created_at", "").isoformat() if job.get("created_at") else "",
-        summary.get("packet_count", 0), summary.get("flow_count", 0), summary.get("alert_count", 0),
-        "; ".join(f"{f.get('rule_id')}: {f.get('title')}" for f in summary.get("findings", [])),
-    ])
-    return Response(
-        content=output.getvalue(),
+    def csv_rows():
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(["analysis_id", "filename", "status", "created_at", "packet_count", "flow_count", "alert_count", "findings"])
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
+        writer.writerow([
+            str(job["_id"]), spreadsheet_safe(job.get("filename", "")), job.get("status", ""),
+            job.get("created_at", "").isoformat() if job.get("created_at") else "",
+            summary.get("packet_count", 0), summary.get("flow_count", 0), summary.get("alert_count", 0),
+        ])
+        prefix = output.getvalue()
+        yield prefix[:-2] + ',"'
+        first = True
+        for finding in iter_analysis_findings(job):
+            if not first:
+                yield "; "
+            first = False
+            value = spreadsheet_safe(f"{finding.get('rule_id')}: {finding.get('title')}")
+            yield value.replace('"', '""')
+        yield '"\r\n'
+
+    return StreamingResponse(
+        content=csv_rows(),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="analysis-{job_id}.csv"'},
     )

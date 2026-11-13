@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from bson import BSON, ObjectId
 from pymongo.errors import PyMongoError
 from scapy.all import Ether, wrpcap
 from starlette.testclient import TestClient
@@ -17,6 +18,15 @@ from app.alerts import (
     materialize_alert_intent,
     relay_next_pending_alert_intent,
     relay_pending_alert_intents_for_job,
+)
+from app.analysis_results import (
+    StaleAnalysisClaimError,
+    analysis_findings_collection,
+    cleanup_orphaned_analysis_findings,
+    cleanup_other_analysis_attempts,
+    ensure_analysis_result_indexes,
+    get_analysis_findings_page,
+    persist_analysis_findings,
 )
 from app.config import get_settings
 from app.database import get_database, set_required_indexes_ready
@@ -47,6 +57,7 @@ def recovery_store(monkeypatch):
     ensure_user_indexes()
     jobs_module.ensure_job_indexes()
     ensure_alert_indexes()
+    ensure_analysis_result_indexes()
     set_required_indexes_ready(True)
     yield
     database_module.close_client()
@@ -344,6 +355,217 @@ def test_many_findings_are_stored_outside_the_analysis_job_document(recovery_sto
     assert alert_outbox_collection().find_one({"job_id": job["_id"]}) is None
 
 
+def test_large_analysis_results_do_not_enlarge_the_job_document(recovery_store, tmp_path):
+    job = create_analysis_job("user", "very-large.pcap", 10, tmp_path / "large.pcap")
+    claimed = claim_job(job["_id"])
+    findings = [
+        {
+            "rule_id": "SIG-LARGE",
+            "rule_version": "1",
+            "title": f"Finding {index}",
+            "description": "x" * 6000,
+            "severity": "medium",
+            "evidence": {"record": index},
+        }
+        for index in range(3000)
+    ]
+
+    assert persist_analysis_findings(job["_id"], claimed["claim_token"], findings) == len(findings)
+    completed = mark_job_completed(
+        job["_id"],
+        claimed["claim_token"],
+        {"finding_count": len(findings), "findings_storage": "analysis_findings"},
+    )
+    stored = get_database()["analysis_jobs"].find_one({"_id": job["_id"]})
+    assert completed["status"] == "completed"
+    assert len(BSON.encode(stored)) < 1024 * 1024
+    assert "findings" not in stored["summary"]
+    assert analysis_findings_collection().count_documents(
+        {"job_id": job["_id"], "claim_token": claimed["claim_token"]}
+    ) == len(findings)
+    assert any(
+        index[0] == ("job_id", "claim_token", "finding_index") and index[1]
+        for index in analysis_findings_collection().unique_indexes
+    )
+    page, total = get_analysis_findings_page(stored, skip=2990, limit=20)
+    assert total == len(findings)
+    assert [item["title"] for item in page] == [f"Finding {index}" for index in range(2990, 3000)]
+
+
+def test_partial_result_writes_recover_without_duplicate_findings(recovery_store, tmp_path):
+    job = create_analysis_job("user", "retry-results.pcap", 10, tmp_path / "retry.pcap")
+    first_claim = claim_job(job["_id"])
+    findings = [{**finding(), "title": f"finding-{index}"} for index in range(5)]
+    assert persist_analysis_findings(job["_id"], first_claim["claim_token"], findings[:2]) == 2
+
+    get_database()["analysis_jobs"].update_one(
+        {"_id": job["_id"]},
+        {"$set": {"lease_expires_at": now_utc() - timedelta(seconds=1)}},
+    )
+    retry_claim = claim_job(job["_id"])
+    assert retry_claim["claim_token"] != first_claim["claim_token"]
+    cleanup_other_analysis_attempts(job["_id"], retry_claim["claim_token"])
+    assert persist_analysis_findings(job["_id"], retry_claim["claim_token"], findings) == 5
+    assert persist_analysis_findings(job["_id"], retry_claim["claim_token"], findings) == 5
+    assert mark_job_completed(job["_id"], retry_claim["claim_token"], {"finding_count": 5})["status"] == "completed"
+
+    stored = get_database()["analysis_jobs"].find_one({"_id": job["_id"]})
+    page, total = get_analysis_findings_page(stored, skip=0, limit=10)
+    assert total == 5
+    assert [item["title"] for item in page] == [item["title"] for item in findings]
+    assert analysis_findings_collection().count_documents({"job_id": job["_id"]}) == 5
+
+
+def test_stale_or_expired_claim_cannot_persist_analysis_findings(recovery_store, tmp_path):
+    job = create_analysis_job("user", "stale-write.pcap", 10, tmp_path / "stale.pcap")
+    first = claim_job(job["_id"])
+    get_database()["analysis_jobs"].update_one(
+        {"_id": job["_id"]},
+        {"$set": {"lease_expires_at": now_utc() - timedelta(seconds=1)}},
+    )
+    replacement = claim_job(job["_id"])
+    assert replacement["claim_token"] != first["claim_token"]
+
+    with pytest.raises(StaleAnalysisClaimError):
+        persist_analysis_findings(job["_id"], first["claim_token"], [finding()])
+    assert analysis_findings_collection().count_documents({"job_id": job["_id"]}) == 0
+
+
+def test_claim_replacement_race_leaves_invisible_row_for_cleanup(recovery_store, tmp_path, monkeypatch):
+    import app.analysis_results as results_module
+
+    job = create_analysis_job("user", "claim-race.pcap", 10, tmp_path / "race.pcap")
+    first = claim_job(job["_id"])
+    original_check = results_module.job_claim_is_active
+    replacement = {}
+
+    def replace_immediately_after_check(job_id, token, **kwargs):
+        nonlocal replacement
+        active = original_check(job_id, token, **kwargs)
+        get_database()["analysis_jobs"].update_one(
+            {"_id": job_id},
+            {"$set": {"lease_expires_at": now_utc() - timedelta(seconds=1)}},
+        )
+        replacement = claim_job(job_id)
+        return active
+
+    monkeypatch.setattr(results_module, "job_claim_is_active", replace_immediately_after_check)
+    assert persist_analysis_findings(job["_id"], first["claim_token"], [finding()]) == 1
+    monkeypatch.setattr(results_module, "job_claim_is_active", original_check)
+
+    scanned, deleted, _cursor = cleanup_orphaned_analysis_findings(batch_size=10)
+    assert scanned >= 1 and deleted == 1
+    assert replacement["claim_token"] != first["claim_token"]
+    assert analysis_findings_collection().count_documents({"job_id": job["_id"]}) == 0
+
+
+def test_orphan_cleanup_preserves_completed_results(recovery_store, tmp_path):
+    job = create_analysis_job("user", "completed-protection.pcap", 10, tmp_path / "done.pcap")
+    claimed = claim_job(job["_id"])
+    persist_analysis_findings(job["_id"], claimed["claim_token"], [finding()])
+    assert mark_job_completed(job["_id"], claimed["claim_token"], {"finding_count": 1})
+    # Add a row from an invalid token to prove cleanup is claim-scoped.
+    analysis_findings_collection().insert_one({
+        "job_id": job["_id"], "claim_token": "invalid-token", "finding_index": 0,
+        "finding": finding(),
+    })
+
+    scanned, deleted, _cursor = cleanup_orphaned_analysis_findings(batch_size=10)
+    stored = get_database()["analysis_jobs"].find_one({"_id": job["_id"]})
+    page, total = get_analysis_findings_page(stored, skip=0, limit=10)
+    assert scanned >= 2 and deleted == 1
+    assert total == 1 and page == [finding()]
+    assert analysis_findings_collection().count_documents(
+        {"job_id": job["_id"], "claim_token": claimed["claim_token"]}
+    ) == 1
+
+
+def test_orphan_cleanup_preserves_current_live_claim(recovery_store, tmp_path):
+    job = create_analysis_job("user", "active-claim.pcap", 10, tmp_path / "active.pcap")
+    claimed = claim_job(job["_id"])
+    assert persist_analysis_findings(job["_id"], claimed["claim_token"], [finding()]) == 1
+
+    scanned, deleted, _cursor = cleanup_orphaned_analysis_findings(batch_size=10)
+
+    assert scanned >= 1 and deleted == 0
+    assert analysis_findings_collection().count_documents(
+        {"job_id": job["_id"], "claim_token": claimed["claim_token"]}
+    ) == 1
+
+
+def test_orphan_cleanup_handles_pymongo_naive_utc_lease(recovery_store, tmp_path):
+    job = create_analysis_job("user", "naive-lease.pcap", 10, tmp_path / "naive.pcap")
+    claimed = claim_job(job["_id"])
+    persist_analysis_findings(job["_id"], claimed["claim_token"], [finding()])
+    get_database()["analysis_jobs"].update_one(
+        {"_id": job["_id"]},
+        {"$set": {"lease_expires_at": (now_utc() + timedelta(minutes=1)).replace(tzinfo=None)}},
+    )
+
+    scanned, deleted, _cursor = cleanup_orphaned_analysis_findings(batch_size=10)
+
+    assert scanned >= 1 and deleted == 0
+    assert analysis_findings_collection().count_documents({"job_id": job["_id"]}) == 1
+
+
+def test_orphan_cleanup_is_bounded_and_eventually_removes_large_backlog(recovery_store):
+    collection = analysis_findings_collection()
+    orphan_count = 450
+    for index in range(orphan_count):
+        collection.insert_one({
+            "job_id": ObjectId(),
+            "claim_token": "orphan-token",
+            "finding_index": index,
+            "finding": finding(),
+        })
+    cursor = None
+    scanned_total = deleted_total = 0
+    while True:
+        scanned, deleted, cursor = cleanup_orphaned_analysis_findings(
+            after_id=cursor,
+            batch_size=37,
+        )
+        assert scanned <= 37
+        scanned_total += scanned
+        deleted_total += deleted
+        if scanned == 0:
+            break
+    assert scanned_total == orphan_count
+    assert deleted_total == orphan_count
+    assert collection.count_documents({"claim_token": "orphan-token"}) == 0
+
+
+def test_orphan_cleanup_failure_is_idempotent_and_preserves_completed_findings(
+    recovery_store, tmp_path, monkeypatch
+):
+    from pymongo.errors import PyMongoError
+
+    job = create_analysis_job("user", "cleanup-failure.pcap", 10, tmp_path / "clean.pcap")
+    claimed = claim_job(job["_id"])
+    persist_analysis_findings(job["_id"], claimed["claim_token"], [finding()])
+    assert mark_job_completed(job["_id"], claimed["claim_token"], {"finding_count": 1})
+    collection = analysis_findings_collection()
+    collection.insert_one({
+        "job_id": job["_id"], "claim_token": "invalid-token", "finding_index": 0,
+        "finding": finding(),
+    })
+    original_delete_one = collection.delete_one
+
+    def fail_delete(_query):
+        raise PyMongoError("controlled cleanup failure")
+
+    monkeypatch.setattr(collection, "delete_one", fail_delete)
+    with pytest.raises(PyMongoError):
+        cleanup_orphaned_analysis_findings(batch_size=10)
+    stored = get_database()["analysis_jobs"].find_one({"_id": job["_id"]})
+    assert get_analysis_findings_page(stored, skip=0, limit=10) == ([finding()], 1)
+
+    monkeypatch.setattr(collection, "delete_one", original_delete_one)
+    _scanned, deleted, _cursor = cleanup_orphaned_analysis_findings(batch_size=10)
+    assert deleted == 1
+    assert get_analysis_findings_page(stored, skip=0, limit=10) == ([finding()], 1)
+
+
 def test_stale_cleanup_preserves_files_referenced_by_nonterminal_jobs(recovery_store, tmp_path):
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
@@ -362,6 +584,8 @@ def test_stale_cleanup_preserves_files_referenced_by_nonterminal_jobs(recovery_s
     jobs = get_database()["analysis_jobs"]
     jobs.update_one({"_id": running["_id"]}, {"$set": {"status": "running"}})
     jobs.update_one({"_id": completed["_id"]}, {"$set": {"status": "completed"}})
+
+    assert "jobs_storage_name_cleanup" in jobs.index_information()
 
     storage_module.cleanup_stale_uploads(settings)
 
@@ -430,6 +654,29 @@ def _assert_running_job_is_recoverable(job, result):
     assert reclaimed["claim_token"] != result["claim_token"]
     assert reclaimed["status"] == "running"
     return reclaimed
+
+
+def test_analysis_time_budget_fails_safely(recovery_store, monkeypatch, tmp_path):
+    job = _make_processable_job(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANALYSIS_TIMEOUT_SECONDS", "1")
+    get_settings.cache_clear()
+
+    class SlowAdapter:
+        def validate(self, _path):
+            return None
+
+        def iter_records(self, _path):
+            time.sleep(1.05)
+            yield {"protocol": "tcp"}
+
+        def metadata(self, _path):
+            return {"source_format": "pcap"}
+
+    monkeypatch.setattr(processor_module, "get_source_adapter", lambda _source: SlowAdapter())
+    result = processor_module.process_analysis_job(job)
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "capture_processing_limit"
 
 
 def test_transient_mongo_error_during_alert_enqueue_remains_recoverable(recovery_store, monkeypatch, tmp_path):
@@ -783,6 +1030,214 @@ def test_shutdown_grace_timeout_defers_database_close_until_workers_exit(recover
     release_heartbeat.set()
     assert heartbeat.stop_and_wait(timeout=2)
     assert database_closed.wait(2)
+
+
+def test_foreground_shutdown_cancels_processing_and_waits_for_heartbeat(
+    recovery_store, monkeypatch, tmp_path
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from app.ingestion.processor import run_foreground_analysis_job, wait_for_active_heartbeats
+    from app.task_coordinator import AnalysisTaskCoordinator
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
+    get_settings.cache_clear()
+    staged = upload_dir / "foreground.pcap"
+    staged.write_bytes(b"interruptible test capture")
+    job = create_analysis_job("user", "foreground.pcap", staged.stat().st_size, staged)
+    coordinator = AnalysisTaskCoordinator()
+    registration = coordinator.register()
+    assert registration is not None
+    parsing_started = threading.Event()
+    close_called = threading.Event()
+
+    class InterruptibleAdapter:
+        def validate(self, _path):
+            return None
+
+        def iter_records(self, _path):
+            parsing_started.set()
+            yield {"protocol": "tcp"}
+            assert registration.cancel_event.wait(2)
+            yield {"protocol": "tcp"}
+
+        def metadata(self, _path):
+            return {"source_format": "pcap"}
+
+    monkeypatch.setattr(processor_module, "get_source_adapter", lambda _source: InterruptibleAdapter())
+    monkeypatch.setattr(processor_module, "LEASE_HEARTBEAT_INTERVAL_SECONDS", 0.02)
+
+    def assert_shutdown_idle(current_coordinator):
+        assert current_coordinator.wait_until_idle(0)
+
+    def assert_heartbeats_stopped():
+        assert wait_for_active_heartbeats(0)
+
+    def close_database_after_workers():
+        assert_shutdown_idle(coordinator)
+        assert_heartbeats_stopped()
+        close_called.set()
+
+    monkeypatch.setattr(main_module, "close_client", close_database_after_workers)
+
+    foreground_executor = ThreadPoolExecutor(max_workers=2)
+    recovery_executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        task_future = foreground_executor.submit(
+            run_foreground_analysis_job, job, coordinator, registration
+        )
+        assert parsing_started.wait(2)
+        stopped_in_grace = main_module._shutdown_application_work(
+            coordinator, threading.Event(), [], recovery_executor, 2
+        )
+        assert stopped_in_grace is True
+        assert task_future.result(timeout=1)["status"] == "running"
+        assert close_called.is_set()
+        assert wait_for_active_heartbeats(0.5)
+        stored = get_database()["analysis_jobs"].find_one({"_id": job["_id"]})
+        assert stored["status"] == "running"
+        assert stored["summary"] is None
+        assert stored["claim_token"]
+
+        get_database()["analysis_jobs"].update_one(
+            {"_id": job["_id"]},
+            {"$set": {"lease_expires_at": now_utc() - timedelta(seconds=1)}},
+        )
+        reclaimed = claim_job(job["_id"])
+        assert reclaimed is not None
+        assert reclaimed["claim_token"] != stored["claim_token"]
+    finally:
+        foreground_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_foreground_completion_start_is_serialized_with_shutdown(
+    recovery_store, monkeypatch, tmp_path
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from app.ingestion.processor import run_foreground_analysis_job
+    from app.task_coordinator import AnalysisTaskCoordinator
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
+    get_settings.cache_clear()
+    staged = upload_dir / "completing.pcap"
+    staged.write_bytes(b"completion race test capture")
+    job = create_analysis_job("user", "completing.pcap", staged.stat().st_size, staged)
+    coordinator = AnalysisTaskCoordinator()
+    registration = coordinator.register()
+    assert registration is not None
+    completion_entered = threading.Event()
+    permit_completion = threading.Event()
+    shutdown_closed_database = threading.Event()
+    original_complete = processor_module.mark_job_completed
+
+    class Adapter:
+        def validate(self, _path):
+            return None
+
+        def iter_records(self, _path):
+            yield {"protocol": "tcp"}
+
+        def metadata(self, _path):
+            return {"source_format": "pcap"}
+
+    monkeypatch.setattr(processor_module, "get_source_adapter", lambda _source: Adapter())
+    monkeypatch.setattr(processor_module, "analyze_records", lambda _records: (
+        {"packet_count": 1, "flow_count": 0, "protocol_counts": {"tcp": 1}}, []
+    ))
+    monkeypatch.setattr(processor_module, "enrich_findings", lambda items, *_args: (items, {"status": "skipped"}))
+
+    def delayed_completion(*args):
+        completion_entered.set()
+        assert permit_completion.wait(2)
+        return original_complete(*args)
+
+    monkeypatch.setattr(processor_module, "mark_job_completed", delayed_completion)
+    monkeypatch.setattr(main_module, "close_client", shutdown_closed_database.set)
+    foreground_executor = ThreadPoolExecutor(max_workers=2)
+    recovery_executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        task_future = foreground_executor.submit(
+            run_foreground_analysis_job, job, coordinator, registration
+        )
+        assert completion_entered.wait(2)
+        shutdown_future = foreground_executor.submit(
+            main_module._shutdown_application_work,
+            coordinator,
+            threading.Event(),
+            [],
+            recovery_executor,
+            2,
+        )
+        assert registration.cancel_event.wait(1)
+        assert not shutdown_closed_database.is_set()
+        permit_completion.set()
+        assert task_future.result(timeout=2)["status"] == "completed"
+        assert shutdown_future.result(timeout=2) is True
+        assert shutdown_closed_database.is_set()
+        stored = get_database()["analysis_jobs"].find_one({"_id": job["_id"]})
+        assert stored["status"] == "completed"
+    finally:
+        permit_completion.set()
+        foreground_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_foreground_registration_is_rejected_after_shutdown():
+    from app.task_coordinator import AnalysisTaskCoordinator
+
+    coordinator = AnalysisTaskCoordinator()
+    task = coordinator.register()
+    assert task is not None
+    coordinator.request_shutdown()
+    assert task.cancel_event.is_set()
+    assert coordinator.register() is None
+    coordinator.finish(task)
+    assert coordinator.wait_until_idle(0)
+
+
+def test_upload_route_registers_analysis_with_application_coordinator(
+    recovery_store, monkeypatch, tmp_path
+):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from fastapi import BackgroundTasks, UploadFile
+    from scapy.all import IP
+    from app.api.analyses import submit_pcap_analysis
+    from app.task_coordinator import AnalysisTaskCoordinator
+
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "uploads"))
+    get_settings.cache_clear()
+    capture = tmp_path / "route-capture.pcap"
+    wrpcap(
+        str(capture),
+        [Ether() / IP(src="192.0.2.2", dst="192.0.2.3")],
+    )
+    coordinator = AnalysisTaskCoordinator()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(analysis_task_coordinator=coordinator)
+        )
+    )
+    background = BackgroundTasks()
+    job = submit_pcap_analysis(
+        background,
+        UploadFile(file=BytesIO(capture.read_bytes()), filename="route.pcap"),
+        {"_id": "foreground-user", "role": "normal_user"},
+        request,
+    )
+
+    assert job["status"] == "queued"
+    assert len(background.tasks) == 1
+    assert not coordinator.wait_until_idle(0)
+    task = background.tasks[0].args[2]
+    coordinator.request_shutdown()
+    assert task.cancel_event.is_set()
+    background.tasks[0].func(*background.tasks[0].args, **background.tasks[0].kwargs)
+    assert coordinator.wait_until_idle(0)
+    stored = get_database()["analysis_jobs"].find_one({"filename": "route.pcap"})
+    assert stored["status"] == "queued"
 
 
 def test_lease_heartbeat_stops_renewing_after_cancellation(recovery_store, monkeypatch, tmp_path):

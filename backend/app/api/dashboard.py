@@ -38,19 +38,50 @@ def dashboard_summary(
         alert_query["severity"] = severity.lower()
     if method:
         alert_query["method"] = method.lower()
-    jobs = list(jobs_collection().find(job_query))
-    alerts = list(alerts_collection().find(alert_query))
-    severities: dict[str, int] = {}
-    methods: dict[str, int] = {}
-    statuses: dict[str, int] = {}
-    for alert in alerts:
-        severities[alert["severity"]] = severities.get(alert["severity"], 0) + 1
-        methods[alert["method"]] = methods.get(alert["method"], 0) + 1
-        statuses[alert["status"]] = statuses.get(alert["status"], 0) + 1
+    job_facets = list(jobs_collection().aggregate([
+        {"$match": job_query},
+        {"$facet": {
+            "total": [{"$count": "count"}],
+            "by_status": [{"$group": {"_id": "$status", "count": {"$sum": 1}}}],
+        }},
+    ]))
+    job_summary = job_facets[0] if job_facets else {}
+    job_count_rows = job_summary.get("total", [])
+    job_counts = {
+        row["_id"]: row["count"]
+        for row in job_summary.get("by_status", [])
+        if row.get("_id") is not None
+    }
+    alert_facets = list(alerts_collection().aggregate([
+        {"$match": alert_query},
+        {"$facet": {
+            "total": [{"$count": "count"}],
+            "by_severity": [{"$group": {"_id": "$severity", "count": {"$sum": 1}}}],
+            "by_method": [{"$group": {"_id": "$method", "count": {"$sum": 1}}}],
+            "by_status": [{"$group": {"_id": "$status", "count": {"$sum": 1}}}],
+        }},
+    ]))
+    facets = alert_facets[0] if alert_facets else {}
+    alert_count_rows = facets.get("total", [])
+    severities = {
+        row["_id"]: row["count"]
+        for row in facets.get("by_severity", [])
+        if row.get("_id") is not None
+    }
+    methods = {
+        row["_id"]: row["count"]
+        for row in facets.get("by_method", [])
+        if row.get("_id") is not None
+    }
+    statuses = {
+        row["_id"]: row["count"]
+        for row in facets.get("by_status", [])
+        if row.get("_id") is not None
+    }
     return {
-        "analysis_count": len(jobs),
-        "jobs_by_status": {state: sum(1 for job in jobs if job.get("status") == state) for state in ("queued", "running", "completed", "failed")},
-        "alert_count": len(alerts),
+        "analysis_count": job_count_rows[0]["count"] if job_count_rows else 0,
+        "jobs_by_status": {state: job_counts.get(state, 0) for state in ("queued", "running", "completed", "failed")},
+        "alert_count": alert_count_rows[0]["count"] if alert_count_rows else 0,
         "alerts_by_severity": severities,
         "alerts_by_method": methods,
         "alerts_by_status": statuses,

@@ -47,6 +47,10 @@ These are narrow pattern detectors. They do not provide broad attack coverage or
 
 Uploaded captures are staged under the backend upload directory and deleted when processing ends. Startup cleanup removes expired staged files using `RETENTION_HOURS`.
 
+The API rejects request bodies above the configured per-file allowance plus bounded multipart overhead before multipart parsing, then enforces the exact streamed file limit in the upload handler. Analysis processing is additionally bounded by packet count and a cooperative elapsed-time budget.
+
+Detailed findings are stored as separate, claim-scoped documents in MongoDB's `analysis_findings` collection. Each finding is limited to 8 MiB, and result pages are bounded. Results become visible only after the matching claim completes. Recovery workers periodically remove findings from invalid, failed, expired, or superseded attempts in bounded batches. On standalone MongoDB, job ownership and finding insertion cannot be made atomic across collections; the completion-token fence prevents stale results from becoming visible, while cleanup removes any stale rows left by the unavoidable race.
+
 ## Environment Setup
 
 If a local environment file does not already exist, copy the sample:
@@ -74,7 +78,11 @@ Rotate the signing key if replacing an existing project key, because this invali
 | `ALLOWED_ORIGINS` | Comma-separated browser origins; defaults to localhost Vite origins. |
 | `UPLOAD_DIR` | Temporary capture staging directory. |
 | `MAX_UPLOAD_MB` | Maximum streamed upload size; defaults to 25 MB. |
+| `MAX_ANALYSIS_PACKETS` | Maximum packets parsed for one analysis; defaults to 50,000. |
+| `ANALYSIS_TIMEOUT_SECONDS` | Processing budget checked during capture parsing and after detection; defaults to 120 seconds. Detection itself is bounded by the packet limit and is not forcibly interrupted mid-rule. |
 | `RETENTION_HOURS` | Maximum staging-file age for startup cleanup; defaults to 24 hours. |
+| `SHUTDOWN_GRACE_SECONDS` | Maximum time the application waits for active workers during shutdown; defaults to 15 seconds. |
+| `MONGODB_SOCKET_TIMEOUT_MS` | MongoDB socket operation timeout; defaults to 5,000 ms. |
 | `THREAT_INTEL_MODE` | `offline` (default) or `local`. |
 | `THREAT_INTEL_FILE` | Optional JSON file used only in `local` mode. Relative paths are resolved from `backend/`; maximum size is 5 MB. |
 
@@ -108,11 +116,19 @@ The backend checks database connectivity through:
 GET /api/v1/health/database
 ```
 
+`GET /api/v1/health` is a liveness endpoint. Database health returns `503` until MongoDB is reachable and required indexes initialize; analysis uploads remain blocked until readiness succeeds.
+
 The automated tests use an in-memory Mongo-compatible fixture and do not require a running MongoDB server.
 
 ## Start the Backend
 
-From the repository root, run the following in PowerShell:
+From the repository root, create the virtual environment if one does not already exist, then install the backend dependencies and start the API:
+
+```powershell
+py -3.11 -m venv .venv
+```
+
+If `.venv` already exists, do not run the creation command. Then:
 
 ```powershell
 cd backend
@@ -140,7 +156,7 @@ From the repository root:
 
 ```powershell
 cd frontend
-npm install
+npm ci
 ```
 
 ### Development Mode
@@ -162,6 +178,8 @@ Build the frontend:
 ```powershell
 npm run build
 ```
+
+For production, install dependencies from a reviewed lock strategy, run Uvicorn behind an HTTPS-terminating reverse proxy, set `ALLOWED_ORIGINS` to exact frontend origins, provision a long random `JWT_SECRET` through a secret manager, and use authenticated MongoDB access with TLS and network restrictions. Restrict write access to `UPLOAD_DIR`; configure the proxy/host to serve frontend security headers (including a deployment-reviewed CSP), rate-limit login and upload requests, and preserve the configured shutdown grace. No hosting provider, TLS proxy, secret manager, or production database provisioning is part of this repository.
 
 Start the local production preview:
 
@@ -219,6 +237,8 @@ Generated capture files are ignored by Git and should not be committed.
 - `POST /api/v1/auth/logout`
 - `GET /api/v1/auth/me`
 
+`POST /api/v1/auth/logout` revokes the presented bearer token immediately. The server stores only its SHA-256 fingerprint and expiration in MongoDB. An expiry TTL index and bounded recovery-worker cleanup remove expired revocation entries; clients should also discard the token after logout.
+
 ### Users
 
 - `GET /api/v1/users`
@@ -233,11 +253,13 @@ Administrator operations are restricted.
 - `POST /api/v1/analyses` — multipart upload using `file`
 - `GET /api/v1/analyses`
 - `GET /api/v1/analyses/{job_id}`
+- `GET /api/v1/analyses/{job_id}/findings?skip=0&limit=50` — bounded, owner-scoped findings page (maximum 100 items). Results are available after job completion.
 - `GET /api/v1/analyses/{job_id}/export`
 
 ### Alerts
 
 - `GET /api/v1/alerts`
+- `GET /api/v1/alerts/export` — streamed CSV export; supports the same severity, method, status, time-range, and text filters as the list route and enforces owner scope.
 - `GET /api/v1/alerts/{alert_id}`
 - `PATCH /api/v1/alerts/{alert_id}` — Administrator only
 
@@ -287,19 +309,23 @@ The automated tests cover:
 - Alert persistence and status changes.
 - Dashboard scoping and filters.
 - Safe export.
+- Claim-scoped finding persistence, duplicate retry behavior, bounded orphan cleanup, pagination, and full CSV streaming.
 - Local IOC enrichment.
 
-The in-memory database fixture clears users, jobs, alerts, audit events, and staged files for each test.
+API and recovery tests use a fresh in-memory Mongo-compatible database per fixture, isolating users, jobs, alerts, outbox records, findings, and audit events. Upload fixtures also remove staged files after each test.
 
 ## Known Limitations
 
-- The in-process FastAPI background task is appropriate for a small demonstration, not durable distributed processing. A process restart can interrupt a job.
+- Execution uses FastAPI background tasks plus a bounded MongoDB recovery dispatcher. A restart interrupts active work; queued jobs and running jobs with expired leases are reclaimed after startup when required indexes and the staged capture still exist. Recovery is not a distributed queue guarantee, and a missing or lost staging volume causes a safe failed job.
+- Detailed findings use one MongoDB document per finding. The bounded orphan sweeper runs through the existing recovery workers; it is not a separate service. On standalone MongoDB, a stale worker can race between ownership validation and a finding insert. Such a row remains invisible unless its claim completes and is removed by a later bounded sweep. Multi-document transactions are not used.
 - The analyzer currently implements two deterministic network signatures: TCP SYN port-scan detection (`SIG-NET-001`) and TCP SYN-flood detection (`SIG-NET-002`). Detection coverage is limited to these patterns and does not guarantee detection of other attack classes.
 - No ML model is included because no compatible, provenance-documented model or dataset was present. Model metrics and evaluation are therefore not claimed.
 - No intelligence feed is bundled; external enrichment is not implemented. Local enrichment requires a user-supplied authorized indicator file.
 - Alert search, pagination, and dashboards operate on the current MongoDB collections. Large-scale aggregation and production load are outside this MVP.
-- Logout removes the bearer token from the client. Server-side token revocation is not implemented, so a token may remain usable until it expires.
-- Shared deployment still requires HTTPS, a least-privilege database account, protected staging permissions, secret rotation, and deployment-specific CORS and storage review.
+- CSV files are protected against common spreadsheet formula injection prefixes. Large exports are streamed by the API, while the current browser download helper buffers the final response as a Blob.
+- Shared deployment still requires HTTPS, a least-privilege MongoDB account, MongoDB TLS/network restrictions, protected staging permissions, secret rotation, explicit production CORS origins, and hosting-specific security headers (including a reviewed Content-Security-Policy).
+- Python requirements are not version-pinned or lockfile-based; repeatable frontend installation uses the committed `package-lock.json` with `npm ci`. Exact clean-machine Python environment reproduction remains unverified.
+- The browser keeps bearer tokens in `localStorage`; cross-site scripting defenses therefore depend on safe React rendering and production hosting CSP/security headers. Login rate limiting is expected at the deployment gateway. The administrator user list currently loads all accounts and is suitable for the project's small user population, not a large directory.
 - End-to-end verification against a live MongoDB service depends on having MongoDB running locally. The automated suite uses an in-memory compatible store.
 
 ## Authoritative Project Documents

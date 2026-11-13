@@ -1,12 +1,14 @@
 """Authentication routes: login, logout, and current user."""
 
 from fastapi import APIRouter, Depends, Response, status
+from fastapi.security import HTTPAuthorizationCredentials
 
 from app.audit import record_audit_event
-from app.deps import get_current_user
+from app.deps import bearer_scheme, get_current_user
 from app.errors import raise_api_error
 from app.schemas import LoginRequest, TokenResponse, UserResponse
 from app.security import create_access_token, verify_password
+from app.token_revocation import revoke_access_token
 from app.users import get_user_by_username, serialize_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -33,7 +35,11 @@ def login(payload: LoginRequest) -> dict:
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(current_user: dict = Depends(get_current_user)) -> Response:
+def logout(
+    current_user: dict = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> Response:
+    revoke_access_token(credentials.credentials)
     record_audit_event(str(current_user["_id"]), "logout", "user", str(current_user["_id"]), "success")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

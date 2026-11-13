@@ -1,6 +1,17 @@
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+
+import jwt
+
 from app.config import get_settings
 from app.roles import ADMINISTRATOR, NORMAL_USER
 from app.security import verify_password
+from app.security import JWT_ALGORITHM
+from app.token_revocation import (
+    cleanup_expired_token_revocations,
+    is_access_token_revoked,
+    token_revocations_collection,
+)
 from app.users import (
     apply_administrator_startup,
     bootstrap_administrator,
@@ -80,6 +91,59 @@ def test_me_requires_authentication(client):
     assert "password_hash" not in authenticated.json()
 
 
+def test_logout_revokes_token_and_prevents_reuse(client):
+    create_normal_user("logout-user")
+    token = login_user(client, "logout-user").json()["access_token"]
+    assert client.get("/api/v1/auth/me", headers=auth_header(token)).status_code == 200
+
+    logout = client.post("/api/v1/auth/logout", headers=auth_header(token))
+
+    assert logout.status_code == 204
+    assert client.get("/api/v1/auth/me", headers=auth_header(token)).status_code == 401
+    assert is_access_token_revoked(token)
+    stored = token_revocations_collection().find_one({"_id": sha256(token.encode()).hexdigest()})
+    assert stored is not None
+    assert token not in str(stored)
+    assert isinstance(stored["expires_at"], datetime)
+
+
+def test_expired_access_token_is_rejected(client):
+    user = create_normal_user("expired-user")
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {"sub": str(user["_id"]), "iat": int((now - timedelta(minutes=2)).timestamp()),
+         "exp": int((now - timedelta(minutes=1)).timestamp())},
+        settings.jwt_secret,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    assert client.get("/api/v1/auth/me", headers=auth_header(token)).status_code == 401
+    missing_expiration = jwt.encode(
+        {"sub": str(user["_id"]), "iat": int(now.timestamp())},
+        settings.jwt_secret,
+        algorithm=JWT_ALGORITHM,
+    )
+    assert client.get(
+        "/api/v1/auth/me", headers=auth_header(missing_expiration)
+    ).status_code == 401
+
+
+def test_expired_revocations_are_cleaned_in_bounded_batches(client):
+    create_normal_user("cleanup-token-user")
+    token = login_user(client, "cleanup-token-user").json()["access_token"]
+    assert client.post("/api/v1/auth/logout", headers=auth_header(token)).status_code == 204
+    key = sha256(token.encode()).hexdigest()
+    collection = token_revocations_collection()
+    collection.update_one(
+        {"_id": key},
+        {"$set": {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)}},
+    )
+
+    assert cleanup_expired_token_revocations(batch_size=1) == 1
+    assert collection.find_one({"_id": key}) is None
+
+
 def test_password_is_stored_as_salted_hash(client):
     del client
     create_normal_user("alice", "Password123")
@@ -87,6 +151,12 @@ def test_password_is_stored_as_salted_hash(client):
     assert stored is not None
     assert stored["password_hash"] != "Password123"
     assert stored["password_hash"].startswith("pbkdf2_sha256$")
+
+
+def test_password_verifier_rejects_resource_exhaustion_hashes_and_malformed_lengths():
+    assert verify_password("Password123", "pbkdf2_sha256$999999999999$" + "00" * 16 + "$" + "00" * 32) is False
+    assert verify_password("Password123", "pbkdf2_sha256$210000$00$00") is False
+    assert verify_password("Password123", "pbkdf2_sha256$0$" + "00" * 16 + "$" + "00" * 32) is False
 
 
 def test_unauthenticated_user_cannot_list_users(client):

@@ -1,15 +1,19 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import datetime, timedelta, timezone
+import csv
+import io
 
 from scapy.all import Ether, IP, TCP, wrpcap
 from scapy.utils import PcapNgWriter
 
 from app.alerts import alerts_collection
+from app.analysis_results import persist_analysis_findings
 from app.database import get_database
-from app.jobs import create_analysis_job, get_job_by_id
+from app.jobs import claim_job, create_analysis_job, get_job_by_id, mark_job_completed
 from app.detection.engine import analyze_records
 from app.roles import ADMINISTRATOR, NORMAL_USER
-from app.users import create_user
+from app.users import create_user, get_user_by_username
 
 
 def auth(token: str) -> dict:
@@ -56,6 +60,17 @@ def test_syn_scan_signature_is_explainable_and_thresholded():
     assert flood["evidence"]["probe_count"] == 100
 
 
+def test_syn_scan_rule_handles_many_repeated_ports_without_quadratic_work():
+    from app.detection.rules import detect_syn_port_scan
+
+    records = [
+        {"timestamp": index / 1000, "src_ip": "192.0.2.10", "dst_ip": "192.0.2.20",
+         "dst_port": 443, "protocol": "tcp", "tcp_flags": "S"}
+        for index in range(10000)
+    ]
+    assert detect_syn_port_scan(records) == []
+
+
 def test_local_indicator_context_is_attached_only_from_configured_data(tmp_path):
     import json
     from app.intelligence import enrich_findings
@@ -79,6 +94,10 @@ def test_runtime_configuration_rejects_weak_jwt_keys_and_unknown_intelligence_mo
     monkeypatch.setenv("THREAT_INTEL_MODE", "remote-without-authorization")
     with pytest.raises(RuntimeError, match="THREAT_INTEL_MODE"):
         Settings()
+    monkeypatch.setenv("THREAT_INTEL_MODE", "offline")
+    monkeypatch.setenv("ALLOWED_ORIGINS", "*")
+    with pytest.raises(RuntimeError, match="explicit browser origins"):
+        Settings()
 
 
 def test_upload_accepts_pcapng(client):
@@ -95,6 +114,26 @@ def test_upload_accepts_pcapng(client):
     job = client.get(f"/api/v1/analyses/{response.json()['id']}", headers=auth(token)).json()
     assert job["status"] == "completed"
     assert job["summary"]["source_format"] == "pcapng"
+
+
+def test_analysis_packet_limit_fails_safely_and_cleans_up(client, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("MAX_ANALYSIS_PACKETS", "5")
+    get_settings.cache_clear()
+    create_user("packet-limit-user", "Password123")
+    token = token_for(client, "packet-limit-user", "Password123")
+    response = client.post(
+        "/api/v1/analyses",
+        headers=auth(token),
+        files={"file": ("controlled-sample.pcap", syn_scan_capture(), "application/vnd.tcpdump.pcap")},
+    )
+    assert response.status_code == 202
+    result = client.get(f"/api/v1/analyses/{response.json()['id']}", headers=auth(token)).json()
+    assert result["status"] == "failed"
+    assert result["error_code"] == "capture_processing_limit"
+    from app.config import get_settings as current_settings
+    assert list(Path(current_settings().upload_dir).glob("*.pcap")) == []
 
 
 def test_upload_persists_completed_analysis_and_alert(client):
@@ -125,6 +164,68 @@ def test_upload_persists_completed_analysis_and_alert(client):
     assert "payload" not in api_alert
     from app.config import get_settings
     assert list(Path(get_settings().upload_dir).glob("*.pcap")) == []
+
+
+def test_analysis_findings_pagination_and_large_csv_export(client, tmp_path):
+    create_user("alice", "Password123", role=NORMAL_USER)
+    create_user("bob", "Password123", role=NORMAL_USER)
+    alice_token = token_for(client, "alice", "Password123")
+    bob_token = token_for(client, "bob", "Password123")
+    owner = get_database()["users"].find_one({"username": "alice"})
+    unsafe_filename = '=HYPERLINK("x","click").pcap'
+    job = create_analysis_job(str(owner["_id"]), unsafe_filename, 1, tmp_path / "capture.pcap")
+    claimed = claim_job(job["_id"])
+    findings = [
+        {
+            "rule_id": "SIG-PAGE-001",
+            "rule_version": "1.0",
+            "title": f'Finding "{index:03d}"',
+            "description": "Paginated finding",
+            "severity": "medium",
+            "category": "test",
+            "method": "signature",
+            "detection_type": "signature",
+            "evidence": {"sequence": index},
+            "indicator_context": [],
+        }
+        for index in range(1225)
+    ]
+    persist_analysis_findings(job["_id"], claimed["claim_token"], findings)
+    mark_job_completed(
+        job["_id"], claimed["claim_token"],
+        {"finding_count": len(findings), "findings_storage": "analysis_findings", "packet_count": len(findings)},
+    )
+    detail = client.get(f"/api/v1/analyses/{job['_id']}", headers=auth(alice_token))
+    assert detail.status_code == 200
+    first_page = detail.json()["summary"]
+    assert len(first_page["findings"]) == 50
+    assert first_page["findings_pagination"] == {"skip": 0, "limit": 50, "total": 1225, "has_more": True}
+    second = client.get(
+        f"/api/v1/analyses/{job['_id']}/findings?skip=50&limit=50",
+        headers=auth(alice_token),
+    )
+    third = client.get(
+        f"/api/v1/analyses/{job['_id']}/findings?skip=1200&limit=50",
+        headers=auth(alice_token),
+    )
+    assert second.status_code == third.status_code == 200
+    assert len(second.json()["items"]) == 50
+    assert len(third.json()["items"]) == 25
+    assert third.json()["has_more"] is False
+    assert client.get(
+        f"/api/v1/analyses/{job['_id']}/findings",
+        headers=auth(bob_token),
+    ).status_code == 403
+
+    exported = client.get(f"/api/v1/analyses/{job['_id']}/export", headers=auth(alice_token))
+    assert exported.status_code == 200
+    rows = list(csv.reader(io.StringIO(exported.text)))
+    assert rows[0][-1] == "findings"
+    assert len(rows) == 2
+    assert rows[1][1] == "'" + unsafe_filename
+    assert rows[1][-1].count("SIG-PAGE-001:") == len(findings)
+    assert 'Finding "000"' in rows[1][-1]
+    assert 'Finding "1224"' in rows[1][-1]
 
 
 def test_upload_rejects_invalid_types_empty_and_malformed_capture(client):
@@ -192,6 +293,113 @@ def test_analysis_and_alert_ownership_admin_visibility_and_dashboard(client):
     assert any(event["action"] == "update_alert_status" for event in get_database()["audit_events"].find({}))
 
 
+def test_database_pagination_filtering_sorting_and_dashboard_aggregations(client, tmp_path):
+    from app.jobs import jobs_collection
+    from app.token_revocation import token_revocations_collection
+
+    alice = create_user("page-alice", "Password123")
+    bob = create_user("page-bob", "Password123")
+    admin = create_user("page-admin", "AdminPass123", role=ADMINISTRATOR)
+    alice_token = token_for(client, "page-alice", "Password123")
+    admin_token = token_for(client, "page-admin", "AdminPass123")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    jobs = []
+    for owner, name, state, offset in [
+        (alice, "Alpha-scan-old.pcap", "failed", 1),
+        (alice, "Alpha-scan-new.pcap", "failed", 2),
+        (alice, "Alpha-complete.pcap", "completed", 3),
+        (bob, "Alpha-other-user.pcap", "failed", 4),
+    ]:
+        job = create_analysis_job(str(owner["_id"]), name, 10, tmp_path / name)
+        jobs_collection().update_one(
+            {"_id": job["_id"]},
+            {"$set": {"status": state, "created_at": base + timedelta(minutes=offset)}},
+        )
+        jobs.append(job)
+
+    job_page_one = client.get(
+        "/api/v1/analyses?status=failed&q=ALPHA-scan&skip=0&limit=1",
+        headers=auth(alice_token),
+    )
+    job_page_two = client.get(
+        "/api/v1/analyses?status=failed&q=ALPHA-scan&skip=1&limit=1",
+        headers=auth(alice_token),
+    )
+    job_empty = client.get(
+        "/api/v1/analyses?status=failed&q=ALPHA-scan&skip=2&limit=1",
+        headers=auth(alice_token),
+    )
+    assert [item["filename"] for item in job_page_one.json()] == ["Alpha-scan-new.pcap"]
+    assert [item["filename"] for item in job_page_two.json()] == ["Alpha-scan-old.pcap"]
+    assert job_empty.json() == []
+
+    alerts = get_database()["alerts"]
+    for owner, title, category, severity, method, state, offset in [
+        (alice, "scan-old", "recon", "high", "signature", "open", 1),
+        (alice, "scan-new", "recon", "high", "signature", "resolved", 2),
+        (alice, "other", "benign", "low", "model", "open", 3),
+        (bob, "scan-private", "recon", "high", "signature", "open", 4),
+    ]:
+        alerts.insert_one({
+            "submitted_by": str(owner["_id"]),
+            "title": title,
+            "category": category,
+            "severity": severity,
+            "method": method,
+            "detection_type": method,
+            "status": state,
+            "occurred_at": base + timedelta(minutes=offset),
+            "job_id": "controlled",
+            "description": "controlled test alert",
+            "evidence": {},
+            "indicator_context": [],
+        })
+    alert_page_one = client.get(
+        "/api/v1/alerts?severity=high&method=signature&q=SCAN&skip=0&limit=1",
+        headers=auth(alice_token),
+    )
+    alert_page_two = client.get(
+        "/api/v1/alerts?severity=high&method=signature&q=SCAN&skip=1&limit=1",
+        headers=auth(alice_token),
+    )
+    alert_empty = client.get(
+        "/api/v1/alerts?severity=high&method=signature&q=SCAN&skip=2&limit=1",
+        headers=auth(alice_token),
+    )
+    assert [item["title"] for item in alert_page_one.json()] == ["scan-new"]
+    assert [item["title"] for item in alert_page_two.json()] == ["scan-old"]
+    assert alert_empty.json() == []
+
+    alice_dashboard = client.get("/api/v1/dashboard", headers=auth(alice_token)).json()
+    assert alice_dashboard["analysis_count"] == 3
+    assert alice_dashboard["jobs_by_status"] == {
+        "queued": 0, "running": 0, "completed": 1, "failed": 2,
+    }
+    assert alice_dashboard["alert_count"] == 3
+    assert alice_dashboard["alerts_by_severity"] == {"high": 2, "low": 1}
+    assert alice_dashboard["alerts_by_method"] == {"signature": 2, "model": 1}
+    assert alice_dashboard["alerts_by_status"] == {"open": 2, "resolved": 1}
+    admin_dashboard = client.get("/api/v1/dashboard", headers=auth(admin_token)).json()
+    assert admin_dashboard["analysis_count"] == 4
+    assert admin_dashboard["alert_count"] == 4
+    assert admin_dashboard["jobs_by_status"]["failed"] == 3
+    assert admin_dashboard["alerts_by_status"]["open"] == 3
+    empty_dashboard = client.get(
+        "/api/v1/dashboard?since=2030-01-01T00:00:00Z", headers=auth(alice_token)
+    ).json()
+    assert empty_dashboard["analysis_count"] == 0
+    assert empty_dashboard["alert_count"] == 0
+    assert empty_dashboard["jobs_by_status"] == {
+        "queued": 0, "running": 0, "completed": 0, "failed": 0,
+    }
+    job_indexes = jobs_collection().index_information()
+    alert_indexes = alerts.index_information()
+    assert "jobs_owner_status_created_page" in job_indexes
+    assert "jobs_status_created_page" in job_indexes
+    assert "alerts_owner_occurred_page" in alert_indexes
+    assert "alerts_severity_occurred_page" in alert_indexes
+    assert token_revocations_collection().index_information()["expired_token_revocations"]["expireAfterSeconds"] == 0
 def test_processing_failure_marks_job_failed_and_health_remains_available(client, tmp_path):
     from app.ingestion.processor import process_analysis_job
 
@@ -213,6 +421,7 @@ def test_failed_database_index_initialization_blocks_analysis_until_recovered(mo
     import pytest
 
     import app.alerts as alerts_module
+    import app.analysis_results as results_module
     import app.database as database_module
     import app.main as main_module
     from app.database import required_indexes_ready
@@ -265,8 +474,23 @@ def test_failed_database_index_initialization_blocks_analysis_until_recovered(mo
 
         # Once index initialization succeeds, the same app can safely accept work.
         monkeypatch.setattr(main_module, "ensure_alert_indexes", alerts_module.ensure_alert_indexes)
+        def fail_result_indexes():
+            raise PyMongoError("simulated analysis result index initialization failure")
+
+        monkeypatch.setattr(main_module, "ensure_analysis_result_indexes", fail_result_indexes)
+        assert main_module.initialize_database(settings) is False
+        assert not required_indexes_ready()
+        monkeypatch.setattr(
+            main_module,
+            "ensure_analysis_result_indexes",
+            results_module.ensure_analysis_result_indexes,
+        )
         assert main_module.initialize_database(settings) is True
         assert required_indexes_ready()
+        assert any(
+            index[0] == ("job_id", "claim_token", "finding_index") and index[1]
+            for index in results_module.analysis_findings_collection().unique_indexes
+        )
         background = BackgroundTasks()
         accepted = submit_pcap_analysis(
             background,
@@ -279,3 +503,114 @@ def test_failed_database_index_initialization_blocks_analysis_until_recovered(mo
         assert get_database_health()["status"] == "ok"
     finally:
         get_settings.cache_clear()
+
+
+def test_missing_mongodb_configuration_keeps_liveness_and_reports_not_ready(client, monkeypatch):
+    from app.config import get_settings
+    from app.database import required_indexes_ready
+    from app.main import initialize_database
+
+    monkeypatch.setenv("MONGODB_URI", "")
+    monkeypatch.setenv("MONGODB_DATABASE", "")
+    get_settings.cache_clear()
+    assert initialize_database(get_settings()) is False
+    assert not required_indexes_ready()
+    assert client.get("/api/v1/health").status_code == 200
+    database_health = client.get("/api/v1/health/database")
+    assert database_health.status_code == 503
+    assert database_health.json()["database"] == "not_configured"
+
+
+def test_cors_preflight_allows_only_configured_origins_and_api_methods(client):
+    from fastapi.middleware.cors import CORSMiddleware
+
+    cors = next(item for item in client.app.user_middleware if item.cls is CORSMiddleware)
+    allowed_origin = cors.kwargs["allow_origins"][0]
+    allowed = client.options(
+        "/api/v1/auth/login",
+        headers={
+            "Origin": allowed_origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == allowed_origin
+    denied = client.options(
+        "/api/v1/auth/login",
+        headers={"Origin": "https://not-configured.invalid", "Access-Control-Request-Method": "POST"},
+    )
+    assert denied.status_code == 400
+    assert "access-control-allow-origin" not in denied.headers
+
+
+def test_upload_body_limiter_rejects_declared_and_chunked_oversize_bodies():
+    import asyncio
+    from app.middleware import UploadBodyLimitMiddleware
+
+    async def consume(scope, receive, send):
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                raise RuntimeError("request body exceeded test limit")
+            if not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def exercise(headers, messages):
+        middleware = UploadBodyLimitMiddleware(consume, path="/api/v1/analyses", max_body_bytes=3)
+        response = []
+        async def receive():
+            return messages.pop(0)
+        async def send(message):
+            response.append(message)
+        await middleware(
+            {"type": "http", "method": "POST", "path": "/api/v1/analyses", "headers": headers},
+            receive,
+            send,
+        )
+        return response
+
+    declared = asyncio.run(exercise(
+        [(b"content-length", b"4")],
+        [{"type": "http.request", "body": b"four", "more_body": False}],
+    ))
+    chunked = asyncio.run(exercise(
+        [],
+        [
+            {"type": "http.request", "body": b"ab", "more_body": True},
+            {"type": "http.request", "body": b"cd", "more_body": True},
+        ],
+    ))
+    for response in (declared, chunked):
+        assert response[0]["status"] == 413
+        assert b'"code": "upload_too_large"' in response[1]["body"]
+
+
+def test_alert_csv_export_is_filtered_and_owner_scoped(client):
+    from bson import ObjectId
+
+    create_user("alice", "Password123", role=NORMAL_USER)
+    create_user("bob", "Password123", role=NORMAL_USER)
+    create_user("admin", "Password123", role=ADMINISTRATOR)
+    alice_token = token_for(client, "alice", "Password123")
+    admin_token = token_for(client, "admin", "Password123")
+    alice_id = str(get_user_by_username("alice")["_id"])
+    bob_id = str(get_user_by_username("bob")["_id"])
+    stamp = datetime.now(timezone.utc)
+    alerts = alerts_collection()
+    alerts.insert_one({"_id": ObjectId(), "job_id": "job-a", "submitted_by": alice_id, "occurred_at": stamp, "severity": "high", "category": "scan", "method": "signature", "detection_type": "signature", "rule_id": "SIG-1", "rule_version": "1", "title": " =HYPERLINK(\"x\",\"click\")", "description": "evidence A", "evidence": {"ports": [22]}, "status": "open"})
+    alerts.insert_one({"_id": ObjectId(), "job_id": "job-b", "submitted_by": bob_id, "occurred_at": stamp, "severity": "high", "category": "scan", "method": "signature", "detection_type": "signature", "rule_id": "SIG-1", "rule_version": "1", "title": "Port scan other owner", "description": "evidence B", "evidence": {"ports": [23]}, "status": "open"})
+    alerts.insert_one({"_id": ObjectId(), "job_id": "job-c", "submitted_by": alice_id, "occurred_at": stamp, "severity": "low", "category": "dns", "method": "signature", "detection_type": "signature", "rule_id": "SIG-2", "rule_version": "1", "title": "DNS event", "description": "evidence C", "evidence": {}, "status": "open"})
+
+    own_export = client.get("/api/v1/alerts/export?severity=high", headers=auth(alice_token))
+    admin_export = client.get("/api/v1/alerts/export?severity=high", headers=auth(admin_token))
+    assert own_export.status_code == 200
+    assert own_export.headers["content-type"].startswith("text/csv")
+    own_rows = list(csv.DictReader(io.StringIO(own_export.text)))
+    admin_rows = list(csv.DictReader(io.StringIO(admin_export.text)))
+    assert [row["job_id"] for row in own_rows] == ["job-a"]
+    assert own_rows[0]["title"].startswith("' =HYPERLINK(")
+    assert {row["job_id"] for row in admin_rows} == {"job-a", "job-b"}
+    assert '"ports":[22]' in own_rows[0]["evidence"]

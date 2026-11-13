@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from threading import BoundedSemaphore
 
 from bson import ObjectId
@@ -33,6 +34,22 @@ def ensure_alert_indexes() -> None:
     collection.create_index("occurred_at")
     collection.create_index("status")
     collection.create_index("dedupe_key", unique=True, sparse=True)
+    collection.create_index(
+        [("submitted_by", 1), ("occurred_at", -1), ("_id", -1)],
+        name="alerts_owner_occurred_page",
+    )
+    collection.create_index(
+        [("severity", 1), ("occurred_at", -1), ("_id", -1)],
+        name="alerts_severity_occurred_page",
+    )
+    collection.create_index(
+        [("method", 1), ("occurred_at", -1), ("_id", -1)],
+        name="alerts_method_occurred_page",
+    )
+    collection.create_index(
+        [("status", 1), ("occurred_at", -1), ("_id", -1)],
+        name="alerts_status_occurred_page",
+    )
     outbox = alert_outbox_collection()
     outbox.create_index(
         [("job_id", 1), ("claim_token", 1), ("dedupe_key", 1)],

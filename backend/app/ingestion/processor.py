@@ -1,10 +1,9 @@
-"""In-process analysis-job processor for this milestone.
+"""Process validated PCAP jobs with signature detection and fenced persistence.
 
-Limitation: there is no separate worker or message queue. After a capture is
-validated and a job is persisted as queued, this processor runs in the API
-process, transitions the job to running, then to completed or failed. HTTP
-clients receive the post-ingestion state; a completed job means parse/ingest
-finished, not signature or ML detection.
+Foreground FastAPI tasks and bounded recovery workers share the same claim,
+lease, alert-outbox, and findings-storage pipeline. A completed job means the
+capture was parsed and the configured signature rules ran; ML scoring remains
+explicitly skipped until an approved model is configured.
 """
 
 from pathlib import Path
@@ -14,6 +13,12 @@ import time
 
 from pymongo.errors import PyMongoError
 
+from app.analysis_results import (
+    StaleAnalysisClaimError,
+    cleanup_other_analysis_attempts,
+    delete_analysis_findings_for_attempt,
+    persist_analysis_findings,
+)
 from app.config import get_settings
 from app.database import required_indexes_ready
 from app.alerts import (
@@ -23,7 +28,7 @@ from app.alerts import (
 )
 from app.detection.engine import analyze_records
 from app.intelligence import enrich_findings
-from app.ingestion.base import CaptureError, InvalidCaptureError
+from app.ingestion.base import CaptureError, CaptureProcessingLimitError, InvalidCaptureError
 from app.ingestion.pcap import get_source_adapter
 from app.ingestion.storage import delete_staged_file
 from app.jobs import (
@@ -137,7 +142,11 @@ def staged_path_for_job(job: dict) -> Path:
     return path
 
 
-def process_analysis_job(job: dict, cancel_event: Event | None = None) -> dict:
+def process_analysis_job(
+    job: dict,
+    cancel_event: Event | None = None,
+    completion_guard=None,
+) -> dict:
     if not required_indexes_ready():
         return get_job_by_id(str(job["_id"])) or job
     if cancel_event is not None and cancel_event.is_set():
@@ -145,10 +154,18 @@ def process_analysis_job(job: dict, cancel_event: Event | None = None) -> dict:
     updated = claim_job(job["_id"])
     if updated is None:
         return get_job_by_id(str(job["_id"])) or job
-    return process_claimed_analysis_job(updated, cancel_event=cancel_event)
+    return process_claimed_analysis_job(
+        updated,
+        cancel_event=cancel_event,
+        completion_guard=completion_guard,
+    )
 
 
-def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = None) -> dict:
+def process_claimed_analysis_job(
+    updated: dict,
+    cancel_event: Event | None = None,
+    completion_guard=None,
+) -> dict:
     if not required_indexes_ready():
         return get_job_by_id(str(updated["_id"])) or updated
     if cancel_event is not None and cancel_event.is_set():
@@ -156,23 +173,35 @@ def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = Non
     claim_token = updated["claim_token"]
     heartbeat = LeaseHeartbeat(updated["_id"], claim_token, cancel_event)
     terminal_update_succeeded = False
+    terminal_status = None
     completed_job = None
     try:
         heartbeat.start()
+        cleanup_other_analysis_attempts(updated["_id"], claim_token)
         if heartbeat.lost.is_set() or (cancel_event is not None and cancel_event.is_set()):
             return get_job_by_id(str(updated["_id"])) or updated
         storage_path = staged_path_for_job(updated)
         adapter = get_source_adapter(updated.get("source_type", "pcap"))
         adapter.validate(storage_path)
         records = []
+        processing_started = time.monotonic()
+        settings = get_settings()
         for record in adapter.iter_records(storage_path):
             if heartbeat.lost.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 return get_job_by_id(str(updated["_id"])) or updated
+            if len(records) >= settings.max_analysis_packets:
+                raise CaptureProcessingLimitError()
+            if time.monotonic() - processing_started > settings.analysis_timeout_seconds:
+                raise CaptureProcessingLimitError()
             records.append(record)
+        if time.monotonic() - processing_started > settings.analysis_timeout_seconds:
+            raise CaptureProcessingLimitError()
         if cancel_event is not None and cancel_event.is_set():
             return updated
         metadata = adapter.metadata(storage_path)
         features, findings = analyze_records(records)
+        if time.monotonic() - processing_started > settings.analysis_timeout_seconds:
+            raise CaptureProcessingLimitError()
         if heartbeat.lost.is_set() or (cancel_event is not None and cancel_event.is_set()):
             return get_job_by_id(str(updated["_id"])) or updated
         settings = get_settings()
@@ -187,9 +216,12 @@ def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = Non
             if not enqueue_alert_intent(updated["_id"], claim_token, intent):
                 return get_job_by_id(str(updated["_id"])) or updated
             alert_keys.add(intent["dedupe_key"])
+        if not heartbeat.renew():
+            return get_job_by_id(str(updated["_id"])) or updated
+        persist_analysis_findings(updated["_id"], claim_token, findings)
         if cancel_event is not None and cancel_event.is_set():
             return updated
-        if heartbeat.lost.is_set():
+        if heartbeat.lost.is_set() or not heartbeat.renew():
             return get_job_by_id(str(updated["_id"])) or updated
         summary = {
             "stage": "analysis",
@@ -199,17 +231,29 @@ def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = Non
             "flow_count": features["flow_count"],
             "protocol_counts": features["protocol_counts"],
             "alert_count": len(alert_keys),
-            "findings": findings,
+            "finding_count": len(findings),
+            "findings_storage": "analysis_findings",
             "enrichment": enrichment,
             "ml_scoring": {"status": "skipped", "reason": "no approved model artifact is configured"},
         }
         if cancel_event is not None and cancel_event.is_set():
             return updated
+        if completion_guard is not None and not completion_guard():
+            return get_job_by_id(str(updated["_id"])) or updated
         completed = mark_job_completed(updated["_id"], claim_token, summary)
         terminal_update_succeeded = completed is not None
+        terminal_status = "completed" if terminal_update_succeeded else None
         if completed is None:
             return updated
         completed_job = completed
+        try:
+            cleanup_other_analysis_attempts(updated["_id"], claim_token)
+        except PyMongoError as exc:
+            logger.warning(
+                "Could not clean abandoned findings for completed analysis job %s (%s).",
+                updated["_id"],
+                type(exc).__name__,
+            )
         if cancel_event is None or not cancel_event.is_set():
             relay_pending_alert_intents_for_job(updated["_id"])
         return completed
@@ -223,12 +267,14 @@ def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = Non
             MissingStagedCaptureError.message,
         )
         terminal_update_succeeded = failed is not None
+        terminal_status = "failed" if terminal_update_succeeded else None
         return failed or updated
     except CaptureError as exc:
         if cancel_event is not None and cancel_event.is_set():
             return updated
         failed = mark_job_failed(updated["_id"], claim_token, exc.error_code, exc.message)
         terminal_update_succeeded = failed is not None
+        terminal_status = "failed" if terminal_update_succeeded else None
         return failed or updated
     except PyMongoError as exc:
         # Do not write a terminal state while the database outcome is uncertain.
@@ -245,9 +291,13 @@ def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = Non
                 type(exc).__name__,
             )
         return completed_job or updated
-    except Exception:
+    except StaleAnalysisClaimError:
+        logger.info("Analysis job %s lost its claim before findings persistence.", updated["_id"])
+        return get_job_by_id(str(updated["_id"])) or updated
+    except Exception as exc:
         if cancel_event is not None and cancel_event.is_set():
             return updated
+        logger.warning("Analysis job %s failed during processing (%s).", updated["_id"], type(exc).__name__)
         failed = mark_job_failed(
             updated["_id"],
             claim_token,
@@ -255,8 +305,30 @@ def process_claimed_analysis_job(updated: dict, cancel_event: Event | None = Non
             "Analysis could not be completed.",
         )
         terminal_update_succeeded = failed is not None
+        terminal_status = "failed" if terminal_update_succeeded else None
         return failed or updated
     finally:
         heartbeat.stop_and_wait()
         if terminal_update_succeeded:
             delete_staged_file(locals().get("storage_path"))
+        if terminal_status == "failed":
+            try:
+                delete_analysis_findings_for_attempt(updated["_id"], claim_token)
+            except PyMongoError as exc:
+                logger.warning(
+                    "Could not clean partial findings for failed analysis job %s (%s).",
+                    updated["_id"],
+                    type(exc).__name__,
+                )
+
+
+def run_foreground_analysis_job(job: dict, coordinator, task) -> dict:
+    """Run a registered upload task and release its coordinator slot on exit."""
+    try:
+        return process_analysis_job(
+            job,
+            cancel_event=task.cancel_event,
+            completion_guard=lambda: coordinator.begin_completion(task.cancel_event, task),
+        )
+    finally:
+        coordinator.finish(task)
