@@ -71,6 +71,7 @@ class Settings:
         self.mongodb_socket_timeout_ms = _positive_int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS"), 5000)
         self.max_analysis_packets = _positive_int(os.getenv("MAX_ANALYSIS_PACKETS"), 50000)
         self.analysis_timeout_seconds = _positive_int(os.getenv("ANALYSIS_TIMEOUT_SECONDS"), 120)
+        self.max_foreground_analyses = _positive_int(os.getenv("MAX_FOREGROUND_ANALYSES"), 2)
         if len(self.jwt_secret) < 32:
             raise RuntimeError("JWT_SECRET must contain at least 32 characters.")
 

@@ -616,12 +616,40 @@ def test_cors_preflight_allows_only_configured_origins_and_api_methods(client):
     )
     assert allowed.status_code == 200
     assert allowed.headers["access-control-allow-origin"] == allowed_origin
+    assert "access-control-allow-credentials" not in allowed.headers
+    assert allowed.headers["x-content-type-options"] == "nosniff"
+    assert allowed.headers["x-frame-options"] == "DENY"
+    assert allowed.headers["referrer-policy"] == "no-referrer"
+    assert allowed.headers["permissions-policy"] == "camera=(), microphone=(), geolocation=()"
     denied = client.options(
         "/api/v1/auth/login",
         headers={"Origin": "https://not-configured.invalid", "Access-Control-Request-Method": "POST"},
     )
     assert denied.status_code == 400
     assert "access-control-allow-origin" not in denied.headers
+
+
+def test_foreground_analysis_capacity_returns_retryable_error_and_cleans_staged_file(client):
+    from app.task_coordinator import AnalysisTaskCoordinator
+
+    coordinator = AnalysisTaskCoordinator(max_active_tasks=1)
+    occupied = coordinator.register()
+    assert occupied is not None
+    client.app.state.analysis_task_coordinator = coordinator
+    create_user("capacity-user", "Password123")
+    token = token_for(client, "capacity-user", "Password123")
+
+    response = client.post(
+        "/api/v1/analyses",
+        headers=auth(token),
+        files={"file": ("capacity.pcap", syn_scan_capture(), "application/vnd.tcpdump.pcap")},
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "analysis_capacity_reached"
+    assert get_database()["analysis_jobs"].count_documents({}) == 0
+    from app.config import get_settings
+    assert list(Path(get_settings().upload_dir).glob("*.pcap")) == []
+    coordinator.finish(occupied)
 
 
 def test_upload_body_limiter_rejects_declared_and_chunked_oversize_bodies():

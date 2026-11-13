@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+import os
 import logging
 
 from fastapi import UploadFile
@@ -18,8 +19,15 @@ class UploadTooLargeError(ValueError):
 
 def ensure_upload_dir(settings: Settings | None = None) -> Path:
     settings = settings or get_settings()
-    settings.upload_dir.mkdir(parents=True, exist_ok=True)
-    return settings.upload_dir
+    directory = settings.upload_dir
+    if os.name != "nt" and directory.is_symlink():
+        raise ValueError("UPLOAD_DIR must not be a symbolic link.")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        if directory.is_symlink():
+            raise ValueError("UPLOAD_DIR must not be a symbolic link.")
+        directory.chmod(0o700)
+    return directory
 
 
 def generated_storage_path(settings: Settings | None = None) -> Path:
@@ -35,9 +43,23 @@ def safe_original_filename(name: str | None) -> str:
 
 def save_upload_stream(upload: UploadFile, destination: Path, max_bytes: int) -> int:
     total = 0
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = None
+    created = False
     try:
-        with destination.open("wb") as handle:
+        if os.name != "nt" and destination.parent.is_symlink():
+            raise ValueError("Staged-file directory must not be a symbolic link.")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt" and destination.parent.is_symlink():
+            raise ValueError("Staged-file directory must not be a symbolic link.")
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        created = True
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with handle:
             while True:
                 chunk = upload.file.read(65_536)
                 if not chunk:
@@ -47,7 +69,10 @@ def save_upload_stream(upload: UploadFile, destination: Path, max_bytes: int) ->
                     raise UploadTooLargeError()
                 handle.write(chunk)
     except Exception:
-        delete_staged_file(destination)
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            delete_staged_file(destination)
         raise
     if total <= 0:
         delete_staged_file(destination)

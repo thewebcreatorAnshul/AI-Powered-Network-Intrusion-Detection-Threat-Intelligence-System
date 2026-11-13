@@ -15,15 +15,18 @@ class ForegroundTask:
 class AnalysisTaskCoordinator:
     """Coordinate task registration, cancellation, completion and shutdown."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_active_tasks: int = 2) -> None:
+        if max_active_tasks < 1:
+            raise ValueError("max_active_tasks must be positive")
         self._condition = Condition()
         self._stopping = False
+        self._max_active_tasks = max_active_tasks
         self._tasks: set[ForegroundTask] = set()
 
     def register(self) -> ForegroundTask | None:
         """Register work unless shutdown has already begun."""
         with self._condition:
-            if self._stopping:
+            if self._stopping or len(self._tasks) >= self._max_active_tasks:
                 return None
             task = ForegroundTask()
             self._tasks.add(task)

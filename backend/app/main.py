@@ -25,7 +25,7 @@ from app.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
-from app.middleware import UploadBodyLimitMiddleware
+from app.middleware import SecurityHeadersMiddleware, UploadBodyLimitMiddleware
 from app.users import apply_administrator_startup, ensure_user_indexes
 from app.jobs import claim_next_recoverable_job, ensure_job_indexes
 from app.ingestion.processor import process_claimed_analysis_job, wait_for_active_heartbeats
@@ -168,9 +168,9 @@ def _shutdown_application_work(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    coordinator = AnalysisTaskCoordinator()
-    app.state.analysis_task_coordinator = coordinator
     settings = get_settings()
+    coordinator = AnalysisTaskCoordinator(max_active_tasks=settings.max_foreground_analyses)
+    app.state.analysis_task_coordinator = coordinator
     db_ready = initialize_database(settings)
 
     recovery_stop = Event()
@@ -213,10 +213,12 @@ def create_app() -> FastAPI:
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH"],
         allow_headers=["Authorization", "Content-Type"],
     )
+    # Register outermost so headers also cover CORS preflight responses.
+    application.add_middleware(SecurityHeadersMiddleware)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
     application.add_exception_handler(RequestValidationError, validation_exception_handler)
     application.add_exception_handler(Exception, unhandled_exception_handler)

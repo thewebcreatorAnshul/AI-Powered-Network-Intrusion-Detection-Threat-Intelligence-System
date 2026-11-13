@@ -18,7 +18,7 @@ The system accepts authorized PCAP and PCAPNG captures, creates scoped analysis 
 - Scoped analysis jobs and reviewable alerts.
 - Role-based access control for Administrators and Normal Users.
 - Only the submitting user and Administrators can access jobs and alerts.
-- Only Administrators can change alert workflow status or manage accounts.
+- Administrators can change any alert's workflow status; Normal Users can change the status only for alerts they own. Only Administrators can manage accounts.
 - Packet and flow summaries with evidence-based detection findings.
 - Optional local threat-intelligence enrichment using an authorized JSON indicator file.
 
@@ -80,6 +80,7 @@ Rotate the signing key if replacing an existing project key, because this invali
 | `MAX_UPLOAD_MB` | Maximum streamed upload size; defaults to 25 MB. |
 | `MAX_ANALYSIS_PACKETS` | Maximum packets parsed for one analysis; defaults to 50,000. |
 | `ANALYSIS_TIMEOUT_SECONDS` | Processing budget checked during capture parsing and after detection; defaults to 120 seconds. Detection itself is bounded by the packet limit and is not forcibly interrupted mid-rule. |
+| `MAX_FOREGROUND_ANALYSES` | Maximum concurrently active foreground analyses per application process; defaults to 2. Additional valid uploads receive a retryable `503` while capacity is full. |
 | `RETENTION_HOURS` | Maximum staging-file age for startup cleanup; defaults to 24 hours. |
 | `SHUTDOWN_GRACE_SECONDS` | Maximum time the application waits for active workers during shutdown; defaults to 15 seconds. |
 | `MONGODB_SOCKET_TIMEOUT_MS` | MongoDB socket operation timeout; defaults to 5,000 ms. |
@@ -131,6 +132,7 @@ py -3.11 -m venv .venv
 If `.venv` already exists, do not run the creation command. Then:
 
 ```powershell
+..\.venv\Scripts\python.exe -m pip install --upgrade pip==26.3
 cd backend
 ..\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
@@ -179,7 +181,7 @@ Build the frontend:
 npm run build
 ```
 
-For production, install dependencies from a reviewed lock strategy, run Uvicorn behind an HTTPS-terminating reverse proxy, set `ALLOWED_ORIGINS` to exact frontend origins, provision a long random `JWT_SECRET` through a secret manager, and use authenticated MongoDB access with TLS and network restrictions. Restrict write access to `UPLOAD_DIR`; configure the proxy/host to serve frontend security headers (including a deployment-reviewed CSP), rate-limit login and upload requests, and preserve the configured shutdown grace. No hosting provider, TLS proxy, secret manager, or production database provisioning is part of this repository.
+For production, install the pinned direct backend requirements and committed npm lockfile, run Uvicorn behind an HTTPS-terminating reverse proxy, set `ALLOWED_ORIGINS` to exact frontend origins, provision a long random `JWT_SECRET` through a secret manager, and use authenticated MongoDB access with TLS and network restrictions. Restrict `UPLOAD_DIR` to the service account; staged files and directories use private POSIX modes, while Windows deployment must apply restrictive inherited ACLs. Configure the proxy/host to serve frontend security headers (including a deployment-reviewed CSP), rate-limit login and upload requests, and preserve the configured shutdown grace. No hosting provider, TLS proxy, secret manager, or production database provisioning is part of this repository.
 
 Start the local production preview:
 
@@ -261,7 +263,7 @@ Administrator operations are restricted.
 - `GET /api/v1/alerts`
 - `GET /api/v1/alerts/export` — streamed CSV export; supports the same severity, method, status, time-range, and text filters as the list route and enforces owner scope.
 - `GET /api/v1/alerts/{alert_id}`
-- `PATCH /api/v1/alerts/{alert_id}` — Administrator only
+- `PATCH /api/v1/alerts/{alert_id}` — Administrator or alert owner; accepts only valid workflow transitions (`open` to `acknowledged` or `resolved`, `acknowledged` to `resolved`, and `resolved` to `open`).
 
 ### Dashboard
 
@@ -280,6 +282,9 @@ Job and alert lists support bounded pagination. Status, search, severity, method
 Run the automated backend tests from the repository root:
 
 ```powershell
+cd backend
+..\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+cd ..
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -323,9 +328,9 @@ API and recovery tests use a fresh in-memory Mongo-compatible database per fixtu
 - No intelligence feed is bundled; external enrichment is not implemented. Local enrichment requires a user-supplied authorized indicator file.
 - Alert search, pagination, and dashboards operate on the current MongoDB collections. Large-scale aggregation and production load are outside this MVP.
 - CSV files are protected against common spreadsheet formula injection prefixes. Large exports are streamed by the API, while the current browser download helper buffers the final response as a Blob.
-- Shared deployment still requires HTTPS, a least-privilege MongoDB account, MongoDB TLS/network restrictions, protected staging permissions, secret rotation, explicit production CORS origins, and hosting-specific security headers (including a reviewed Content-Security-Policy).
-- Python requirements are not version-pinned or lockfile-based; repeatable frontend installation uses the committed `package-lock.json` with `npm ci`. Exact clean-machine Python environment reproduction remains unverified.
-- The browser keeps bearer tokens in `localStorage`; cross-site scripting defenses therefore depend on safe React rendering and production hosting CSP/security headers. Login rate limiting is expected at the deployment gateway. The administrator user list currently loads all accounts and is suitable for the project's small user population, not a large directory.
+- Shared deployment still requires HTTPS, a least-privilege MongoDB account, MongoDB TLS/network restrictions, protected staging permissions, secret rotation, explicit production CORS origins, login/upload rate limiting at the gateway, and frontend hosting security headers (including a reviewed Content-Security-Policy). The API adds baseline content-type, framing, referrer, and permissions headers; HSTS and CSP must be configured at the HTTPS/frontend host.
+- Direct Python runtime and test dependencies are version-pinned, and frontend dependencies use the committed `package-lock.json` with `npm ci`. An isolated Python 3.12.10 install from `requirements-dev.txt` passed the full backend suite; an isolated Node 24.14.0 `npm ci` and production build also passed. Python transitive dependencies are not lockfile-pinned. The fresh virtual environment's bundled pip was upgraded to 26.3 after the vulnerability scan reported advisories in its original pip 25.0.1.
+- The browser keeps bearer tokens in `localStorage`; cross-site scripting defenses therefore depend on safe React rendering and production hosting CSP/security headers. Login rate limiting is expected at the deployment gateway. Foreground analysis admission is bounded per API process; multi-process deployments multiply the configured cap. The administrator user list currently loads all accounts and is suitable for the project's small user population, not a large directory.
 - End-to-end verification against a live MongoDB service depends on having MongoDB running locally. The automated suite uses an in-memory compatible store.
 
 ## Authoritative Project Documents

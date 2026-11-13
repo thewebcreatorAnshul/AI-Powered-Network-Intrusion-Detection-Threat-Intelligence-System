@@ -18,7 +18,7 @@ This checklist records implementation and verification status for the current M1
 | FR-10 ML scoring | Not available | No approved model artifact, compatible feature schema, or provenance-documented dataset was present. Jobs explicitly record scoring as skipped. |
 | FR-11 Alert creation | Implemented | Persistent alert IDs, timestamp, severity, method, rule reference, evidence, job/user ownership, and workflow status. |
 | FR-12 Threat context | Partial | Optional local JSON indicator matching is implemented. No local IOC list or external provider is bundled/configured. |
-| FR-13 Alert review | Implemented | Scoped list/detail, text/severity/method/status/time filters, pagination; Administrators can update alert state. |
+| FR-13 Alert review | Implemented | Scoped list/detail, text/severity/method/status/time filters, pagination; Administrators can update any alert and Normal Users can update alerts they own using valid transitions. Successful updates are audited. |
 | FR-14 Dashboard | Implemented | Real Mongo-backed job/alert metrics, ownership scoping, and severity/method/time filters. |
 | FR-15 Audit trail | Implemented | Login, role/user changes, upload/launch, denied access, and alert-state changes record safe metadata. |
 | FR-16 Export | Implemented | Owner/Admin-scoped analysis-summary and filtered-alert CSV exports. API exports stream rows; the current browser helper buffers the returned Blob. |
@@ -33,7 +33,7 @@ This checklist records implementation and verification status for the current M1
 - Finding writes check current claim ownership at bounded checkpoints. Since standalone MongoDB cannot atomically validate a job in one collection and write a finding in another, a narrow stale-write race remains possible. Such records are not visible and the bounded orphan sweeper eventually removes them.
 - Real MongoDB 9.0.4 standalone verification used isolated database `intrusion_detection_results_cleanup_integration_test`; the database was removed after successful checks. It verified stale claim rejection, the post-validation race, bounded removal of 242 invalid rows in eight data batches (plus an exhaustion check), and preservation of completed findings. No transaction was used and the production database was not modified.
 - A second isolated MongoDB 9.0.4 standalone check verified that cleanup preserves an active claim, removes it after lease expiry/reclaim, and keeps the replacement completed result visible. It used and then dropped only `intrusion_detection_results_cleanup_active_integration_test`. It also exercised MongoDB's naive-UTC datetime decoding.
-- Final production-readiness audit: 87 backend tests passed with one Starlette/httpx TestClient deprecation warning; 8 frontend dependency-free tests passed; Vite production build, Python `compileall`, and `git diff --check` passed. Browser automation is disabled in the current Work settings, so no browser visual/accessibility session is claimed.
+- Follow-up non-ML audit (2026-11-14): 96 backend tests passed with one Starlette/httpx TestClient deprecation warning; 12 frontend tests passed; Vite 8.3.7 production build, `npm audit` (zero reported vulnerabilities), `pip check`, Python `compileall`, and `git diff --check` passed. A clean isolated Python 3.12.10 install from `requirements-dev.txt` passed all 96 backend tests; clean Node 24.14.0 `npm ci` and production build passed. `pip-audit` reported no known vulnerabilities in the pinned Python requirements; a new venv's bundled pip 25.0.1 did report advisories, and upgrading that isolated installer to pip 26.3 cleared its scan. Browser automation is disabled in current Work settings, and MongoDB was not reachable during this audit; no current browser or live-database verification is claimed. Prior isolated MongoDB integration results remain recorded below.
 
 ## Backend query and token lifecycle verification
 
@@ -47,14 +47,14 @@ This checklist records implementation and verification status for the current M1
 
 | SRS | Status | Verification / limit |
 |---|---|---|
-| NFR-01 Security | Implemented | Protected API dependencies and ownership checks are tested. |
+| NFR-01 Security | Implemented with deployment controls | Protected API dependencies and ownership checks are tested; CORS is explicit and bearer-only, API baseline security headers are set. Frontend CSP/HSTS and gateway rate limits remain deployment-owned. |
 | NFR-02 Password safety | Implemented | Salted PBKDF2 password hashes; JWT key is environment-only and requires at least 32 characters; sample environment file uses placeholders. |
 | NFR-03 Transport | Partial | README requires HTTPS outside local demos; TLS termination is deployment-owned and not configured here. |
 | NFR-04 Input safety | Implemented with operational caps | Upload bodies are limited before multipart parsing, file size/type/parse are validated, and processing has configurable packet and elapsed-time budgets. CPU detection is bounded by packet count and checked against the deadline after the rule pass rather than forcibly interrupted mid-rule. |
 | NFR-05 Privacy | Implemented | Packet payloads are not included in normalized records; staging files are deleted after processing and stale files are cleaned at startup. |
 | NFR-06 Usability | Partial | Responsive sign-in, upload, job, alert, and admin views with empty/loading/error states exist; no evaluator usability session has been measured. |
 | NFR-07 Performance | Partial | Synthetic PCAPs of approximately 1 MB, 10 MB, 20 MB, and 24 MB completed below the two-minute target. The 24 MB capture contained 20,696 packets and completed in 24 seconds based on the UI timestamps. The 50 MB capture was rejected by the 25 MB upload limit. Representative real-world traffic and performance on other machines remain unverified. |
-| NFR-08 Reliability | Partial | Malformed input and processing-failure paths are covered; index/readiness guards, leases, startup recovery, shutdown cancellation, and bounded orphan cleanup are implemented. Restarts interrupt active work; recovery waits for lease expiry, and a missing/lost staging volume prevents recovery. |
+| NFR-08 Reliability | Partial | Malformed input and processing-failure paths are covered; index/readiness guards, leases, startup recovery, shutdown cancellation, bounded foreground admission, and bounded orphan cleanup are implemented. Restarts interrupt active work; recovery waits for lease expiry, and a missing/lost staging volume prevents recovery. |
 | NFR-09 Maintainability | Implemented | API, adapters, feature extraction, rule catalog, persistence, and React views are separated. |
 | NFR-10 Explainability | Implemented | Findings identify signature/rule/version, severity, description, and evidence. |
 | NFR-11 Compatibility | Partial | Vite production build passes; no Chromium/browser matrix test was run. |
@@ -71,7 +71,7 @@ This checklist records implementation and verification status for the current M1
 | AC-05 | Verified | Alert persistence, detail, evidence, method, severity, and state are tested. |
 | AC-06 | Verified | Dashboard ownership and severity/time filters plus alert filters are tested. |
 | AC-07 | Verified | A processing failure is persisted as failed and health remains available. |
-| AC-08 | Partial | The documented local setup, live MongoDB workflow, backend tests, frontend tests, and production build were verified in the existing development environment. A clean-machine reproduction and independent Python dependency installation were not run during the final audit. |
+| AC-08 | Partial | A clean isolated Python 3.12.10 install from `requirements-dev.txt` passed all backend tests; clean Node 24.14.0 `npm ci` and build passed. Live MongoDB connectivity and manual end-to-end verification were unavailable during this audit. |
 
 ## Design deviations and operational limits
 
@@ -82,7 +82,7 @@ This checklist records implementation and verification status for the current M1
 - Live MongoDB connectivity was verified through the database health endpoint. Analysis history was confirmed to persist after a backend restart.
 - Synthetic capture timings were measured on the current test machine. The largest successful tested capture was approximately 24 MB, containing 20,696 packets, which completed in 24 seconds. The 50 MB capture was rejected by the 25 MB upload limit. Representative real-world capture performance remains unverified. FR-07 and NFR-07 report the same timing evidence; neither should be considered full verification of real-world performance.
 - The existing SRS and SDD were read-only during implementation.
-- Security hardening in the final audit rejects wildcard CORS origins, rejects malformed or excessive PBKDF2 parameters in stored hashes, protects CSV text from common spreadsheet formula prefixes, bounds packet count and processing time, and keeps database readiness false if MongoDB is unconfigured. The sample JWT and admin password values cannot be used as production credentials.
+- Security hardening rejects wildcard CORS origins, does not permit cross-origin browser credentials for the bearer-token API, adds baseline API security headers, stores staged PCAPs with private POSIX permissions and exclusive file creation, rejects malformed or excessive PBKDF2 parameters in stored hashes, protects CSV text from common spreadsheet formula prefixes, bounds packet count, processing time and foreground concurrency, and keeps database readiness false if MongoDB is unconfigured. The sample JWT and admin password values cannot be used as production credentials.
 - Local browser automation was unavailable because Codex Work settings disabled browser controls. React text rendering was statically checked for unsafe HTML sinks; no rendered browser, keyboard, responsive, contrast, or assistive-technology audit is claimed.
-- Backend Python dependency versions remain unpinned. MongoDB auth/TLS, production secrets, HTTPS, reverse-proxy request limits/security headers, and deployment-host configuration remain external prerequisites.
+- Direct Python runtime and test dependencies are pinned to versions present in the verified environment; transitive Python packages are not lockfile-pinned. `pip-audit` found no known vulnerabilities in the pinned requirements. MongoDB auth/TLS, production secrets, HTTPS, frontend CSP/HSTS, gateway login rate limits, and deployment-host configuration remain external prerequisites.
 - The browser stores bearer tokens in `localStorage`, login rate limiting is deployment-gateway-owned, and the Administrator account list is unpaginated; these fit the current small-project scope but need attention before broad public or large-directory deployment.

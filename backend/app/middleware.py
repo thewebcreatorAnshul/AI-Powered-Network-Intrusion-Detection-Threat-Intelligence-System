@@ -3,6 +3,34 @@
 import json
 
 
+class SecurityHeadersMiddleware:
+    """Add safe baseline headers to API responses, including CORS preflights."""
+
+    HEADERS = (
+        (b"x-content-type-options", b"nosniff"),
+        (b"x-frame-options", b"DENY"),
+        (b"referrer-policy", b"no-referrer"),
+        (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+    )
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def send_with_security_headers(message):
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in {key for key, _ in self.HEADERS}
+                ]
+                headers.extend(self.HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
+
+
 class UploadBodyLimitMiddleware:
     """Reject over-limit upload bodies before Starlette parses/spools multipart data."""
 

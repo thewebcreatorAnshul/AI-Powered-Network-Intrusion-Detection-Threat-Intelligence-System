@@ -113,6 +113,12 @@ def submit_pcap_analysis(
     task = coordinator.register()
     if task is None:
         delete_staged_file(destination)
+        if not coordinator.stopping:
+            raise_api_error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "analysis_capacity_reached",
+                "The service is processing its maximum number of analyses. Retry shortly.",
+            )
         raise_api_error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "application_shutting_down",
