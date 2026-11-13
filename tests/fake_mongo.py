@@ -40,6 +40,8 @@ def _matches(document: dict, query: dict) -> bool:
             for operator, value in expected.items():
                 if operator == "$ne" and value in values:
                     return False
+                if operator == "$in" and not any(item in value for item in values):
+                    return False
                 if operator == "$gte" and not any(item is not None and item >= value for item in values):
                     return False
                 if operator == "$lte" and not any(item is not None and item <= value for item in values):
@@ -192,8 +194,9 @@ class Collection:
         with self._lock:
             for item in self.documents:
                 if _matches(item, query):
+                    before = deepcopy(item)
                     _apply_update(item, update, query)
-                    return deepcopy(item)
+                    return deepcopy(item) if return_document else before
         return None
 
     def delete_many(self, query):

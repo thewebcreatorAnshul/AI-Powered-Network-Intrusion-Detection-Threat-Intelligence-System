@@ -290,7 +290,87 @@ def test_analysis_and_alert_ownership_admin_visibility_and_dashboard(client):
     updated = client.patch(f"/api/v1/alerts/{alert['_id']}", headers=auth(admin), json={"status": "acknowledged"})
     assert updated.status_code == 200
     assert updated.json()["status"] == "acknowledged"
-    assert any(event["action"] == "update_alert_status" for event in get_database()["audit_events"].find({}))
+    event = next(event for event in get_database()["audit_events"].find({}) if event["action"] == "update_alert_status")
+    assert event["actor_id"] == str(get_user_by_username("admin")["_id"])
+    assert event["target_id"] == str(alert["_id"])
+    assert event["safe_metadata"]["previous_status"] == "open"
+    assert event["safe_metadata"]["new_status"] == "acknowledged"
+    assert event["occurred_at"] is not None
+
+
+def test_alert_status_transitions_are_owner_scoped_audited_and_metadata_safe(client):
+    create_user("status-owner", "Password123")
+    create_user("status-other", "Password123")
+    create_user("status-admin", "AdminPass123", role=ADMINISTRATOR)
+    owner_token = token_for(client, "status-owner", "Password123")
+    other_token = token_for(client, "status-other", "Password123")
+    admin_token = token_for(client, "status-admin", "AdminPass123")
+    owner_id = str(get_user_by_username("status-owner")["_id"])
+
+    uploaded = client.post(
+        "/api/v1/analyses",
+        headers=auth(owner_token),
+        files={"file": ("status-scan.pcap", syn_scan_capture(), "application/vnd.tcpdump.pcap")},
+    ).json()
+    alert = alerts_collection().find_one({"job_id": uploaded["id"]})
+    alert_id = str(alert["_id"])
+    original = {key: alert[key] for key in ("submitted_by", "severity", "evidence", "rule_id", "detection_type")}
+
+    acknowledged = client.patch(f"/api/v1/alerts/{alert_id}", headers=auth(owner_token), json={"status": "acknowledged"})
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["status"] == "acknowledged"
+    assert "status_updated_by" not in acknowledged.json()
+    stored = alerts_collection().find_one({"_id": alert["_id"]})
+    assert stored["status_updated_by"] == owner_id
+    assert stored["status_updated_at"] is not None
+    assert stored["updated_at"] == stored["status_updated_at"]
+    assert {key: stored[key] for key in original} == original
+
+    assert client.patch(f"/api/v1/alerts/{alert_id}", headers=auth(owner_token), json={"status": "open"}).status_code == 409
+    assert client.patch(f"/api/v1/alerts/{alert_id}", headers=auth(owner_token), json={"status": "dismissed"}).status_code == 422
+    assert client.patch(
+        f"/api/v1/alerts/{alert_id}",
+        headers=auth(owner_token),
+        json={"status": "resolved", "severity": "low", "submitted_by": "someone-else"},
+    ).status_code == 422
+    assert client.patch(f"/api/v1/alerts/{alert_id}", headers=auth(other_token), json={"status": "resolved"}).status_code == 403
+
+    resolved = client.patch(f"/api/v1/alerts/{alert_id}", headers=auth(owner_token), json={"status": "resolved"})
+    assert resolved.status_code == 200
+    reopened = client.patch(f"/api/v1/alerts/{alert_id}", headers=auth(admin_token), json={"status": "open"})
+    assert reopened.status_code == 200
+    assert reopened.json()["status"] == "open"
+
+    events = [event for event in get_database()["audit_events"].find({"target_id": alert_id}) if event["action"] == "update_alert_status"]
+    assert len(events) == 3
+    assert [(event["safe_metadata"]["previous_status"], event["safe_metadata"]["new_status"]) for event in events] == [
+        ("open", "acknowledged"), ("acknowledged", "resolved"), ("resolved", "open"),
+    ]
+    assert [event["actor_id"] for event in events] == [owner_id, owner_id, str(get_user_by_username("status-admin")["_id"])]
+
+
+def test_concurrent_alert_status_updates_cannot_apply_the_same_transition_twice(client):
+    from concurrent.futures import ThreadPoolExecutor
+    from bson import ObjectId
+    from app.alerts import update_alert_status
+
+    alert_id = alerts_collection().insert_one({
+        "submitted_by": "transition-owner",
+        "status": "open",
+        "severity": "high",
+        "evidence": {"source_ip": "192.0.2.10"},
+    }).inserted_id
+
+    def acknowledge(actor):
+        return update_alert_status(
+            str(alert_id), "acknowledged", actor_id=actor, owner_id="transition-owner",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(acknowledge, ("actor-a", "actor-b")))
+    assert sum(result is not None for result in results) == 1
+    stored = alerts_collection().find_one({"_id": ObjectId(str(alert_id))})
+    assert stored["status"] == "acknowledged"
 
 
 def test_database_pagination_filtering_sorting_and_dashboard_aggregations(client, tmp_path):

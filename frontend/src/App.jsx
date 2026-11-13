@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { Link, NavLink, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { Activity, AlertTriangle, ArrowDownToLine, ArrowUpRight, BarChart3, Check, ChevronRight, CircleHelp, Clock3, FileSearch, FileUp, Fingerprint, LayoutDashboard, LoaderCircle, LockKeyhole, LogOut, Menu, Network, Search, Shield, ShieldCheck, Siren, UserRoundCog, Users, X } from 'lucide-react'
 import { api, downloadFile, query, saveDownload, token, uploadFile } from './api'
+import { alertStatusActions } from './alertStatus'
 
 const cx = (...parts) => parts.filter(Boolean).join(' ')
 const fmtDate = value => value ? new Date(value).toLocaleString() : '—'
@@ -74,7 +75,7 @@ function App() {
           <Route path="/analyses" element={<Analyses />} />
           <Route path="/analyses/:id" element={<AnalysisDetail />} />
           <Route path="/alerts" element={<Alerts admin={admin} />} />
-          <Route path="/alerts/:id" element={<AlertDetail admin={admin} />} />
+          <Route path="/alerts/:id" element={<AlertDetail admin={admin} userId={user.id} />} />
           {admin && <Route path="/users" element={<UsersPage currentUser={user} />} />}
           <Route path="*" element={<NotFound />} />
         </Routes>
@@ -300,7 +301,11 @@ function Alerts({ admin }) {
     try { const file = await downloadFile(`/alerts/export${exportSearch}`, 'alerts.csv'); saveDownload(file.blob, file.filename) }
     catch (e) { setExportError(e.message) } finally { setExporting(false) }
   }
-  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    load()
+    window.addEventListener('alert-status-updated', load)
+    return () => window.removeEventListener('alert-status-updated', load)
+  }, [load])
   return <>
     <PageHeading title="Threat alerts" description="Investigate explainable findings linked to your analysis jobs." action={<><button className="button secondary" onClick={exportAlerts} disabled={exporting}><ArrowDownToLine size={15} /> {exporting ? 'Preparing…' : 'Export CSV'}</button><button className="button secondary" onClick={load}><Activity size={16} /> Refresh</button></>} />
     <div className="filter-row alert-filters"><div className="filter-label"><Search size={15} /> FILTER ALERTS</div><div className="search-box"><Search size={15} /><input aria-label="Search alert title or category" placeholder="Search title or category…" value={filters.q} onChange={e => setFilters({ ...filters, q: e.target.value, skip: 0 })} /></div><select aria-label="Filter alerts by severity" value={filters.severity} onChange={e => setFilters({ ...filters, severity: e.target.value, skip: 0 })}><option value="">All severities</option>{['critical', 'high', 'medium', 'low'].map(s => <option key={s}>{s}</option>)}</select><select aria-label="Filter alerts by detection method" value={filters.method} onChange={e => setFilters({ ...filters, method: e.target.value, skip: 0 })}><option value="">All methods</option><option value="signature">Signature</option><option value="model">Model</option></select><select aria-label="Filter alerts by workflow status" value={filters.status} onChange={e => setFilters({ ...filters, status: e.target.value, skip: 0 })}><option value="">All states</option><option value="open">Open</option><option value="acknowledged">Acknowledged</option><option value="resolved">Resolved</option></select></div>
@@ -309,17 +314,32 @@ function Alerts({ admin }) {
   </>
 }
 
-function AlertDetail({ admin }) {
+function AlertDetail({ admin, userId }) {
   const { id } = useParams()
   const [alert, setAlert] = useState(null)
   const [error, setError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const load = useCallback(async () => { try { setAlert(await api(`/alerts/${id}`)); setError('') } catch (e) { setError(e.message) } }, [id])
   useEffect(() => { load() }, [load])
-  async function updateStatus(status) { setBusy(true); try { setAlert(await api(`/alerts/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) })) } catch (e) { setError(e.message) } finally { setBusy(false) } }
+  async function updateStatus(nextStatus) {
+    if (busy || !window.confirm(`Change alert status from ${alert.status} to ${nextStatus}?`)) return
+    setBusy(true); setActionError(''); setNotice('')
+    try {
+      const updated = await api(`/alerts/${id}`, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) })
+      setAlert(updated)
+      setNotice(`Alert status changed to ${nextStatus}.`)
+      window.dispatchEvent(new Event('alert-status-updated'))
+      try { setAlert(await api(`/alerts/${id}`)) }
+      catch (refreshError) { setActionError(`Status changed, but the latest details could not be refreshed: ${refreshError.message}`) }
+    } catch (e) { setActionError(e.message) } finally { setBusy(false) }
+  }
   if (error) return <ErrorBanner message={error} onRetry={load} />
   if (!alert) return <LoadingPage />
-  return <><PageHeading eyebrow="ALERT INVESTIGATION" title={alert.title} description={`${alert.category} · detected ${fmtDate(alert.occurred_at)}`} action={<Link to="/alerts" className="button secondary">Back to alerts</Link>} /><section className="panel alert-detail-panel"><div className="alert-detail-head"><div><SeverityPill severity={alert.severity} /><span className="method-tag"><Fingerprint size={13} /> {alert.method}</span></div><StatusPill status={alert.status} /></div><p className="alert-description">{alert.description}</p><div className="detail-facts"><Fact label="Rule identifier" value={`${alert.rule_id} · version ${alert.rule_version}`} /><Fact label="Detection method" value={alert.detection_type} /><Fact label="Source analysis" value={alert.job_id} link={`/analyses/${alert.job_id}`} /><Fact label="Observed at" value={fmtDate(alert.occurred_at)} /></div><h3 className="subheading">Evidence</h3><div className="evidence-grid evidence-detail">{Object.entries(alert.evidence || {}).map(([key, value]) => <Fact key={key} label={key.replaceAll('_', ' ')} value={Array.isArray(value) ? value.join(', ') : String(value)} />)}</div>{alert.indicator_context?.length > 0 && <div className="indicator-note"><ShieldCheck size={13} /> Local indicator context: {alert.indicator_context.map(item => `${item.indicator} (${item.source})`).join(', ')}</div>}{admin && <div className="alert-actions"><span>Workflow status</span>{['open', 'acknowledged', 'resolved'].map(status => <button key={status} disabled={busy || alert.status === status} className={cx('button', alert.status === status ? 'button-muted' : 'secondary')} onClick={() => updateStatus(status)}>{alert.status === status && <Check size={14} />}{status}</button>)}</div>}</section></>
+  const canManage = admin || alert.submitted_by === userId
+  const actions = canManage ? alertStatusActions(alert.status) : []
+  return <><PageHeading eyebrow="ALERT INVESTIGATION" title={alert.title} description={`${alert.category} · detected ${fmtDate(alert.occurred_at)}`} action={<Link to="/alerts" className="button secondary">Back to alerts</Link>} /><section className="panel alert-detail-panel"><div className="alert-detail-head"><div><SeverityPill severity={alert.severity} /><span className="method-tag"><Fingerprint size={13} /> {alert.method}</span></div><StatusPill status={alert.status} /></div><p className="alert-description">{alert.description}</p><div className="detail-facts"><Fact label="Rule identifier" value={`${alert.rule_id} · version ${alert.rule_version}`} /><Fact label="Detection method" value={alert.detection_type} /><Fact label="Source analysis" value={alert.job_id} link={`/analyses/${alert.job_id}`} /><Fact label="Observed at" value={fmtDate(alert.occurred_at)} /></div><h3 className="subheading">Evidence</h3><div className="evidence-grid evidence-detail">{Object.entries(alert.evidence || {}).map(([key, value]) => <Fact key={key} label={key.replaceAll('_', ' ')} value={Array.isArray(value) ? value.join(', ') : String(value)} />)}</div>{alert.indicator_context?.length > 0 && <div className="indicator-note"><ShieldCheck size={13} /> Local indicator context: {alert.indicator_context.map(item => `${item.indicator} (${item.source})`).join(', ')}</div>}{canManage && <section className="status-management" aria-labelledby="status-management-title"><div className="status-management-current"><div><span className="panel-kicker">WORKFLOW STATUS</span><h3 id="status-management-title">Manage alert status</h3></div><StatusPill status={alert.status} /></div>{notice && <p className="status-notice" role="status" aria-live="polite">{notice}</p>}{actionError && <div className="alert-error" role="alert">{actionError}</div>}<div className="alert-actions">{actions.map(action => <button key={action.status} type="button" className="button secondary" disabled={busy} aria-busy={busy} aria-label={`${action.label} alert ${alert.title}`} onClick={() => updateStatus(action.status)}>{busy && <LoaderCircle className="spin" size={14} />}{busy ? 'Updating…' : action.label}</button>)}</div></section>}</section></>
 }
 
 function Fact({ label, value, link }) { return <div className="fact"><span>{label}</span>{link ? <Link to={link}>{value}</Link> : <b>{value}</b>}</div> }

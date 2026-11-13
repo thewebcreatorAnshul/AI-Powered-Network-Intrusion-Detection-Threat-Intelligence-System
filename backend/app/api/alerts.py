@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from app.alerts import alerts_collection, get_alert_by_id, serialize_alert, update_alert_status
 from app.audit import record_audit_event
-from app.deps import get_current_admin, get_current_user
+from app.deps import get_current_user
 from app.csv_utils import spreadsheet_safe
 from app.errors import raise_api_error
 from app.roles import ADMINISTRATOR
@@ -126,10 +126,42 @@ def read_alert(alert_id: str, current_user: dict = Depends(get_current_user)) ->
 def change_alert_status(
     alert_id: str,
     payload: AlertStatusUpdate,
-    admin: dict = Depends(get_current_admin),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
-    alert = update_alert_status(alert_id, payload.status)
+    alert = get_alert_by_id(alert_id)
     if alert is None:
         raise_api_error(status.HTTP_404_NOT_FOUND, "not_found", "Alert not found.")
-    record_audit_event(str(admin["_id"]), "update_alert_status", "alert", alert_id, "success", {"status": payload.status})
-    return serialize_alert(alert)
+    if not _owned_alert(alert, current_user):
+        record_audit_event(str(current_user["_id"]), "forbidden_access", "alert", alert_id, "failure")
+        raise_api_error(status.HTTP_403_FORBIDDEN, "forbidden", "You do not have permission to access this resource.")
+
+    actor_id = str(current_user["_id"])
+    owner_id = None if current_user.get("role") == ADMINISTRATOR else actor_id
+    result = update_alert_status(
+        alert_id,
+        payload.status,
+        actor_id=actor_id,
+        owner_id=owner_id,
+    )
+    if result is None:
+        latest = get_alert_by_id(alert_id)
+        if latest is None:
+            raise_api_error(status.HTTP_404_NOT_FOUND, "not_found", "Alert not found.")
+        if not _owned_alert(latest, current_user):
+            raise_api_error(status.HTTP_403_FORBIDDEN, "forbidden", "You do not have permission to access this resource.")
+        raise_api_error(status.HTTP_409_CONFLICT, "invalid_status_transition", "The alert status has changed or this transition is not allowed.")
+
+    updated_alert, previous_status = result
+    record_audit_event(
+        actor_id,
+        "update_alert_status",
+        "alert",
+        alert_id,
+        "success",
+        {
+            "status": payload.status,
+            "previous_status": previous_status,
+            "new_status": payload.status,
+        },
+    )
+    return serialize_alert(updated_alert)

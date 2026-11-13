@@ -16,6 +16,11 @@ from app.jobs import jobs_collection, mark_alert_intent_delivered, now_utc
 OUTBOX_RELAY_CONCURRENCY = 2
 OUTBOX_RELAY_BATCH_SIZE = 100
 OUTBOX_SCAN_BATCH_SIZE = 500
+ALERT_STATUS_TRANSITIONS = {
+    "open": frozenset({"acknowledged", "resolved"}),
+    "acknowledged": frozenset({"resolved"}),
+    "resolved": frozenset({"open"}),
+}
 _outbox_relay_slots = BoundedSemaphore(OUTBOX_RELAY_CONCURRENCY)
 
 
@@ -307,12 +312,48 @@ def serialize_alert(document: dict) -> dict:
     return {"id": str(document["_id"]), **{key: document.get(key) for key in fields}}
 
 
-def update_alert_status(alert_id: str, status: str) -> dict | None:
-    alert = get_alert_by_id(alert_id)
-    if alert is None:
+def update_alert_status(
+    alert_id: str,
+    new_status: str,
+    *,
+    actor_id: str,
+    owner_id: str | None = None,
+) -> tuple[dict, str] | None:
+    """Apply one allowed workflow transition atomically and return its preimage."""
+    allowed_previous = [
+        previous
+        for previous, targets in ALERT_STATUS_TRANSITIONS.items()
+        if new_status in targets
+    ]
+    if not allowed_previous:
         return None
-    alerts_collection().update_one(
-        {"_id": alert["_id"]},
-        {"$set": {"status": status, "updated_at": datetime.now(timezone.utc)}},
+    try:
+        object_id = ObjectId(alert_id)
+    except (InvalidId, TypeError):
+        return None
+    query = {"_id": object_id, "status": {"$in": allowed_previous}}
+    if owner_id is not None:
+        query["submitted_by"] = owner_id
+    timestamp = datetime.now(timezone.utc)
+    previous = alerts_collection().find_one_and_update(
+        query,
+        {"$set": {
+            "status": new_status,
+            "updated_at": timestamp,
+            "updated_by": actor_id,
+            "status_updated_at": timestamp,
+            "status_updated_by": actor_id,
+        }},
+        return_document=False,
     )
-    return get_alert_by_id(alert_id)
+    if previous is None:
+        return None
+    updated = {
+        **previous,
+        "status": new_status,
+        "updated_at": timestamp,
+        "updated_by": actor_id,
+        "status_updated_at": timestamp,
+        "status_updated_by": actor_id,
+    }
+    return updated, previous.get("status", "open")

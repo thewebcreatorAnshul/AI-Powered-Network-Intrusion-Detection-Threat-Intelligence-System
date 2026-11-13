@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.roles import NORMAL_USER
 
@@ -70,4 +70,6 @@ class AnalysisJobResponse(BaseModel):
 
 
 class AlertStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     status: Literal["open", "acknowledged", "resolved"]
